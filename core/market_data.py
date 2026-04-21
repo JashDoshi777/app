@@ -47,8 +47,9 @@ try:
     from SmartApi import SmartConnect
     from SmartApi.smartWebSocketV2 import SmartWebSocketV2
     SMARTAPI_OK = True
-except ImportError:
+except Exception as _e:
     SMARTAPI_OK = False
+    logger.warning("SmartAPI import failed: %s", _e)
 
 try:
     import pyotp

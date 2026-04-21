@@ -6,8 +6,6 @@ import logging
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 logger = logging.getLogger(__name__)
@@ -21,6 +19,7 @@ app = FastAPI(
     version="2.0.0",
 )
 
+from starlette.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,16 +28,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Verify static directory exists
+# Mount static files
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     logger.info("Static files mounted from: %s", STATIC_DIR)
 else:
-    logger.error("Static directory not found: %s", STATIC_DIR)
-
-templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+    logger.error("STATIC DIR NOT FOUND: %s", STATIC_DIR)
 
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    """Serve the dashboard — read HTML directly to avoid Jinja2 version issues."""
+    html_file = TEMPLATE_DIR / "index.html"
+    if html_file.exists():
+        return HTMLResponse(content=html_file.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>index.html not found</h1>", status_code=500)
