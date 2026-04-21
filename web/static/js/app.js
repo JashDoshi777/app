@@ -73,9 +73,11 @@ function initModeButtons() {
 function startClock() {
     const update = () => {
         const now = new Date();
-        const ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000) - (now.getTimezoneOffset() * 60 * 1000));
-        document.getElementById('live-time').textContent =
-            ist.toLocaleTimeString('en-IN', { hour12: false });
+        const istTime = now.toLocaleTimeString('en-IN', {
+            hour12: false,
+            timeZone: 'Asia/Kolkata'
+        });
+        document.getElementById('live-time').textContent = istTime;
     };
     update();
     setInterval(update, 1000);
