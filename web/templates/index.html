@@ -6,10 +6,18 @@
     <title>NIFTY OI Tracker — Live</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=2">
+    <style>
+        /* Critical inline CSS fallback */
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:'Inter',sans-serif;background:#0c0e14;color:#e8eaed;min-height:100vh;font-size:13px}
+        .toolbar{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:#141620;border-bottom:1px solid rgba(255,255,255,0.06);flex-wrap:wrap;gap:8px}
+        .toolbar-left,.toolbar-center,.toolbar-right{display:flex;align-items:center;gap:12px}
+        .tab-nav{display:flex;background:#141620;border-bottom:1px solid rgba(255,255,255,0.06);padding:0 16px}
+        .tab-panel{display:none}.tab-panel.active{display:block}
+    </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script>
 </head>
 <body>
 
@@ -161,6 +169,6 @@
     </div>
 </section>
 
-<script src="/static/js/app.js"></script>
+<script src="/static/js/app.js?v=2"></script>
 </body>
 </html>
