@@ -18,7 +18,6 @@ import uvicorn
 import config
 from core.market_data import MarketDataService
 from core.option_chain import OptionChainAnalyzer
-from core.instruments import InstrumentManager
 from web.app import app
 from web.api_routes import router as api_router, inject_engines
 
@@ -415,12 +414,10 @@ def main():
 
     # Core engines
     market_data = MarketDataService()
-    instruments = InstrumentManager()
     option_chain = OptionChainAnalyzer("NIFTY")
 
     state = {
         "market_data": market_data,
-        "instruments": instruments,
         "option_chain_analyzer": option_chain,
         "db_engine": db_ok,
         "data_buffer": data_buffer,
