@@ -17,3 +17,4 @@ python-dotenv>=1.0
 requests>=2.31
 websocket-client>=1.7
 six>=1.16
+logzero>=1.7
