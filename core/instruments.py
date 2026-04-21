@@ -25,7 +25,7 @@ class InstrumentManager:
 
     def __init__(self):
         self._instruments: Optional[pd.DataFrame] = None
-        self._cache_file = config.CACHE_DIR / "instruments.parquet"
+        self._cache_file = config.CACHE_DIR / "instruments.csv"
         self._load()
 
     def _load(self):
@@ -34,7 +34,7 @@ class InstrumentManager:
             age = (datetime.now().timestamp() - self._cache_file.stat().st_mtime) / 3600
             if age < 24:
                 try:
-                    self._instruments = pd.read_parquet(self._cache_file)
+                    self._instruments = pd.read_csv(self._cache_file)
                     logger.info("Instruments loaded from cache: %d rows", len(self._instruments))
                     return
                 except Exception:
@@ -44,14 +44,14 @@ class InstrumentManager:
     def refresh(self):
         """Download fresh instrument list (free CSV, no API key needed)."""
         try:
-            logger.info("Downloading instrument master...")
-            df = pd.read_csv(INSTRUMENT_URL)
+            logger.info("Downloading Dhan instrument master...")
+            df = pd.read_csv(INSTRUMENT_URL, low_memory=False)
             fno = df[df["SEM_SEGMENT"].isin(["NSE_FNO", "BSE_FNO"])]
             self._instruments = fno.reset_index(drop=True)
-            self._instruments.to_parquet(self._cache_file)
+            self._instruments.to_csv(self._cache_file, index=False)
             logger.info("Instruments refreshed: %d F&O instruments", len(self._instruments))
         except Exception as e:
-            logger.error("Instrument download failed: %s", e)
+            logger.error("Dhan instrument download failed: %s", e)
             self._instruments = pd.DataFrame()
 
     def get_security_id(self, symbol: str, option_type: str = "CE",

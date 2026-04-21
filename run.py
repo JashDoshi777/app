@@ -1,14 +1,15 @@
 """
-Options Data Engine — Main Entry Point.
-Fetches live option chain every minute, logs to database, serves dashboard.
+Options Data Engine — Production Entry Point.
+Fetches live option chain every minute, logs to NeonDB, serves dashboard.
+Includes: auto-reconnect, DB retry, health checks.
 """
 
-import asyncio
 import logging
 import os
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from collections import deque
 
@@ -41,17 +42,21 @@ logger = logging.getLogger("MAIN")
 #  IN-MEMORY DATA BUFFER (for fast UI serving)
 # ═══════════════════════════════════════════════════════════
 
-# Stores the latest snapshots in memory for instant API access
 data_buffer = {
-    "oi_table": deque(maxlen=500),        # Last 500 minute rows (market snapshots)
-    "oi_strikes": deque(maxlen=500),      # Last 500 per-strike snapshots
-    "candles_1m": deque(maxlen=500),       # 1-min OHLC candles
-    "latest_chain": None,                  # Latest full option chain DataFrame
+    "oi_table": deque(maxlen=500),
+    "oi_strikes": deque(maxlen=500),
+    "candles_1m": deque(maxlen=500),
+    "latest_chain": None,
     "latest_underlying": 0,
     "prev_pe_ce_diff": 0,
     "prev_total_ce_oi": 0,
     "prev_total_pe_oi": 0,
     "db_available": False,
+    "last_log_time": None,
+    "total_logs": 0,
+    "errors": 0,
+    "data_source": "NONE",
+    "start_time": datetime.now(IST).isoformat(),
 }
 
 
@@ -84,23 +89,39 @@ def data_logger_loop(state):
     candle_volume = 0
     last_candle_minute = -1
 
+    consecutive_failures = 0
+    MAX_FAILURES_BEFORE_RECONNECT = 5
+
     while True:
         try:
             now_ist = datetime.now(IST)
 
             if not is_market_open():
-                # Outside market hours — sleep longer
                 time.sleep(30)
                 continue
+
+            # ── Auto-reconnect Angel One if too many failures ──
+            if consecutive_failures >= MAX_FAILURES_BEFORE_RECONNECT:
+                logger.warning("[RECONNECT] %d consecutive failures, re-initializing...", consecutive_failures)
+                try:
+                    md._init_tier1_smartapi()
+                    consecutive_failures = 0
+                    logger.info("[RECONNECT] Angel One session refreshed.")
+                except Exception as re:
+                    logger.error("[RECONNECT] Failed: %s", re)
 
             # ── Fetch live data ──────────────────────────
             underlying = md.get_ltp("NIFTY") or 0
             chain_df = md.get_option_chain("NIFTY")
 
-            if chain_df.empty or underlying <= 0:
-                logger.warning("No data received — retrying in 30s")
+            if chain_df is None or chain_df.empty or underlying <= 0:
+                consecutive_failures += 1
+                data_buffer["errors"] += 1
+                logger.warning("No data received (attempt %d) - retrying in 30s", consecutive_failures)
                 time.sleep(30)
                 continue
+
+            consecutive_failures = 0  # Reset on success
 
             data_buffer["latest_chain"] = chain_df
             data_buffer["latest_underlying"] = underlying
@@ -198,24 +219,36 @@ def data_logger_loop(state):
             data_buffer["prev_pe_ce_diff"] = pe_ce_diff
             data_buffer["prev_total_ce_oi"] = total_ce_oi
             data_buffer["prev_total_pe_oi"] = total_pe_oi
+            data_buffer["last_log_time"] = now_ist.isoformat()
+            data_buffer["total_logs"] += 1
+            data_buffer["data_source"] = getattr(md, '_data_source_log', 'UNKNOWN')
 
-            # ── Save to database ─────────────────────────
+            # ── Save to database (with retry) ────────────
             if db_engine:
-                try:
-                    _save_to_db(db_engine, now_ist, snapshot, chain_df, underlying, future_ltp, pcr, pe_ce_diff, pe_ce_diff_change, straddle, atm, atm_ce_ltp, atm_pe_ltp, total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol)
-                except Exception as e:
-                    logger.error("DB write failed: %s", e)
+                for attempt in range(3):
+                    try:
+                        _save_to_db(db_engine, now_ist, snapshot, chain_df, underlying, future_ltp, pcr, pe_ce_diff, pe_ce_diff_change, straddle, atm, atm_ce_ltp, atm_pe_ltp, total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol)
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            logger.warning("DB write attempt %d failed: %s - retrying...", attempt + 1, e)
+                            time.sleep(2)
+                        else:
+                            logger.error("DB write failed after 3 attempts: %s", e)
+                            data_buffer["errors"] += 1
 
             logger.info(
-                "[DATA] %s | NIFTY: %.2f | CE OI: %s | PE OI: %s | PE-CE: %s | PCR: %.2f | Straddle: %.2f",
+                "[DATA] %s | NIFTY: %.2f | CE OI: %s | PE OI: %s | PE-CE: %s | PCR: %.2f | Straddle: %.2f | Src: %s",
                 now_ist.strftime("%H:%M:%S"), underlying,
                 _fmt_lakh(total_ce_oi), _fmt_lakh(total_pe_oi),
-                _fmt_lakh(pe_ce_diff), pcr, straddle
+                _fmt_lakh(pe_ce_diff), pcr, straddle,
+                data_buffer["data_source"]
             )
 
             time.sleep(60)
 
         except Exception as e:
+            data_buffer["errors"] += 1
             logger.error("Data logger error: %s", e, exc_info=True)
             time.sleep(15)
 
@@ -367,13 +400,18 @@ def init_database_sync():
 
 def main():
     logger.info("=" * 60)
-    logger.info("  OPTIONS DATA ENGINE — Live OI Logger")
+    logger.info("  NIFTY OI TRACKER — Production")
     logger.info("=" * 60)
 
-    # Init database
-    db_ok = init_database_sync()
-    if db_ok:
-        data_buffer["db_available"] = True
+    # Init database (with retry)
+    db_ok = None
+    for attempt in range(3):
+        db_ok = init_database_sync()
+        if db_ok:
+            data_buffer["db_available"] = True
+            break
+        logger.warning("DB init attempt %d failed, retrying in 5s...", attempt + 1)
+        time.sleep(5)
 
     # Core engines
     market_data = MarketDataService()
@@ -389,6 +427,21 @@ def main():
     }
 
     logger.info("Data Tier: %s", market_data.data_tier)
+    logger.info("DB: %s", "CONNECTED" if db_ok else "DISABLED")
+
+    # Health endpoint for HuggingFace container monitoring
+    @app.get("/health")
+    async def health_check():
+        return {
+            "status": "healthy",
+            "uptime": str(datetime.now(IST) - datetime.fromisoformat(data_buffer["start_time"])),
+            "total_logs": data_buffer["total_logs"],
+            "errors": data_buffer["errors"],
+            "last_log": data_buffer["last_log_time"],
+            "data_source": data_buffer["data_source"],
+            "db_connected": data_buffer["db_available"],
+            "market_open": is_market_open(),
+        }
 
     # Inject into API
     inject_engines(state)
