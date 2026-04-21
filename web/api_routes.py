@@ -197,11 +197,11 @@ async def get_price_vs_oi(strike: float = 0):
 async def get_strikes():
     """Available strikes around ATM."""
     buf = _engine_state.get("data_buffer")
-    if not buf or not buf.get("latest_chain") is not None:
+    if not buf:
         return {"strikes": [], "atm": 0}
 
     chain = buf.get("latest_chain")
-    if chain is None or chain.empty:
+    if chain is None or (hasattr(chain, 'empty') and chain.empty):
         return {"strikes": [], "atm": 0}
 
     underlying = buf.get("latest_underlying", 0)
