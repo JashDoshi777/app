@@ -22,7 +22,7 @@ import math
 import random
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from collections import defaultdict
 
@@ -30,6 +30,9 @@ import pandas as pd
 import numpy as np
 
 import config
+
+# IST timezone (UTC+5:30) — critical for market hours detection
+IST = timezone(timedelta(hours=5, minutes=30))
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +113,9 @@ class MarketDataService:
         self._ws = None
         self._ws_connected = False
         self._lock = threading.Lock()
+        self._smart_api = None  # Store SmartAPI session for REST calls
+        self._instrument_df = None  # Instrument master for option token lookup
+        self._data_source_log = "NONE"  # Track where data actually came from
 
         # Rate limit tracking
         self._yf_last_call: float = 0
@@ -171,10 +177,16 @@ class MarketDataService:
                 feed_token = smart_api.getfeedToken()
                 jwt_token = session_data["data"]["jwtToken"]
 
+                # Store SmartAPI object for REST calls (option chain)
+                self._smart_api = smart_api
+
+                # Download instrument master for option token lookups
+                self._load_instrument_master()
+
                 # Start WebSocket in background thread
                 self._start_websocket(jwt_token, api_key, client_id, feed_token)
                 self._tier = "WEBSOCKET"
-                logger.info("✅ TIER 1 ACTIVE: Angel One WebSocket (real-time, <50ms)")
+                logger.info("[OK] TIER 1 ACTIVE: Angel One WebSocket (real-time)")
             else:
                 logger.warning("SmartAPI session failed: %s", session_data.get("message"))
 
@@ -205,7 +217,7 @@ class MarketDataService:
                         logger.debug("WS tick error: %s", e)
 
                 def on_open(wsapp):
-                    logger.info("WebSocket connected — subscribing to instruments...")
+                    logger.info("WebSocket connected - subscribing to instruments...")
                     # Subscribe to NIFTY and BANKNIFTY LTP (mode 1 = LTP only)
                     tokens = [
                         {"exchangeType": 1, "tokens": [SMARTAPI_TOKENS["NIFTY"]]},
@@ -241,6 +253,162 @@ class MarketDataService:
         ws_thread = threading.Thread(target=_run, daemon=True, name="ws-feed")
         ws_thread.start()
 
+    def _load_instrument_master(self):
+        """Download Angel One instrument master for option token lookups."""
+        try:
+            url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+            resp = _requests.get(url, timeout=30)
+            data = resp.json()
+            self._instrument_df = pd.DataFrame(data)
+            logger.info("[OK] Instrument master loaded: %d instruments", len(self._instrument_df))
+        except Exception as e:
+            logger.warning("Instrument master download failed: %s", e)
+            self._instrument_df = None
+
+    def _get_option_tokens(self, symbol: str = "NIFTY", underlying_price: float = 0):
+        """Get Angel One tokens for option contracts near ATM."""
+        if self._instrument_df is None or self._instrument_df.empty:
+            return []
+
+        df = self._instrument_df
+
+        # Filter for NIFTY options in NFO segment
+        nfo = df[(df["exch_seg"] == "NFO") & (df["name"] == symbol.upper())]
+        if nfo.empty:
+            return []
+
+        # Filter option type (CE/PE), exclude futures
+        opts = nfo[nfo["instrumenttype"].isin(["OPTIDX"])].copy()
+        if opts.empty:
+            return []
+
+        # Parse strike and get nearest expiry
+        opts["strike_num"] = pd.to_numeric(opts["strike"], errors="coerce") / 100
+        opts = opts.dropna(subset=["strike_num"])
+
+        # Get nearest expiry
+        opts["expiry_dt"] = pd.to_datetime(opts["expiry"], format="%d%b%Y", errors="coerce")
+        future_expiries = opts[opts["expiry_dt"] >= datetime.now(IST).replace(tzinfo=None)]
+        if future_expiries.empty:
+            return []
+
+        nearest_expiry = future_expiries["expiry_dt"].min()
+        current = opts[opts["expiry_dt"] == nearest_expiry]
+
+        # Filter strikes near ATM (+-500 points for NIFTY)
+        si = config.INDICES.get(symbol, {}).get("strike_interval", 50)
+        if underlying_price > 0:
+            atm = round(underlying_price / si) * si
+            current = current[abs(current["strike_num"] - atm) <= si * 10]
+
+        return current
+
+    def _fetch_angel_option_chain(self, symbol: str = "NIFTY") -> pd.DataFrame:
+        """
+        Fetch live option chain using Angel One SmartAPI getMarketData(mode='FULL').
+        FULL mode returns OI (opnInterest), volume, LTP, OHLC per instrument.
+        Batches up to 50 tokens per call for efficiency.
+        """
+        if not self._smart_api or self._instrument_df is None:
+            return pd.DataFrame()
+
+        underlying = self.get_ltp(symbol) or 0
+        if underlying <= 0:
+            return pd.DataFrame()
+
+        option_contracts = self._get_option_tokens(symbol, underlying)
+        if option_contracts is None or len(option_contracts) == 0:
+            return pd.DataFrame()
+
+        si = config.INDICES.get(symbol, {}).get("strike_interval", 50)
+        atm = round(underlying / si) * si
+
+        # Build token list and mapping: token -> (strike, CE/PE)
+        token_map = {}
+        all_tokens = []
+        for _, contract in option_contracts.iterrows():
+            strike = float(contract["strike_num"])
+            token = str(contract["token"])
+            sym = str(contract["symbol"])
+            opt_type = "CE" if "CE" in sym else "PE"
+            token_map[token] = {"strike": strike, "type": opt_type, "symbol": sym,
+                                "expiry": str(contract.get("expiry", ""))}
+            all_tokens.append(token)
+
+        # Batch fetch: getMarketData supports up to 50 tokens per call
+        strikes_data = {}
+        batch_size = 50
+
+        for i in range(0, len(all_tokens), batch_size):
+            batch = all_tokens[i:i + batch_size]
+            try:
+                result = self._smart_api.getMarketData(
+                    mode="FULL",
+                    exchangeTokens={"NFO": batch}
+                )
+
+                if not result or not result.get("data") or not result["data"].get("fetched"):
+                    logger.warning("getMarketData returned no data for batch %d", i)
+                    continue
+
+                for item in result["data"]["fetched"]:
+                    token = str(item.get("symbolToken", ""))
+                    if token not in token_map:
+                        continue
+
+                    info = token_map[token]
+                    strike = info["strike"]
+                    opt_type = info["type"]
+                    prefix = "ce" if opt_type == "CE" else "pe"
+
+                    if strike not in strikes_data:
+                        strikes_data[strike] = {
+                            "strike": strike,
+                            "expiry": info["expiry"],
+                        }
+
+                    strikes_data[strike][f"{prefix}_ltp"] = float(item.get("ltp", 0))
+                    strikes_data[strike][f"{prefix}_oi"] = int(item.get("opnInterest", 0))
+                    strikes_data[strike][f"{prefix}_volume"] = int(item.get("tradeVolume", 0))
+                    # OI change not directly available — compute from previous snapshot
+                    strikes_data[strike][f"{prefix}_chg_oi"] = int(item.get("opnInterest", 0)) - int(item.get("lastDayOI", 0)) if item.get("lastDayOI") else 0
+                    strikes_data[strike][f"{prefix}_iv"] = 0  # IV not in this endpoint
+
+            except Exception as e:
+                logger.warning("getMarketData batch %d failed: %s", i, e)
+                time.sleep(0.5)
+                continue
+
+            time.sleep(0.1)  # Small delay between batches
+
+        if not strikes_data:
+            return pd.DataFrame()
+
+        # Build DataFrame
+        rows = []
+        for strike, data in sorted(strikes_data.items()):
+            rows.append({
+                "strike": data["strike"],
+                "expiry": data.get("expiry", ""),
+                "ce_oi": data.get("ce_oi", 0),
+                "ce_chg_oi": data.get("ce_chg_oi", 0),
+                "ce_volume": data.get("ce_volume", 0),
+                "ce_ltp": data.get("ce_ltp", 0),
+                "ce_iv": data.get("ce_iv", 0),
+                "ce_delta": 0, "ce_gamma": 0, "ce_theta": 0, "ce_vega": 0,
+                "pe_oi": data.get("pe_oi", 0),
+                "pe_chg_oi": data.get("pe_chg_oi", 0),
+                "pe_volume": data.get("pe_volume", 0),
+                "pe_ltp": data.get("pe_ltp", 0),
+                "pe_iv": data.get("pe_iv", 0),
+                "pe_delta": 0, "pe_gamma": 0, "pe_theta": 0, "pe_vega": 0,
+            })
+
+        df = pd.DataFrame(rows)
+        self._data_source_log = "ANGEL_ONE_API"
+        logger.info("[LIVE] Option chain from Angel One: %d strikes, OI data included", len(df))
+        return df
+
     # ═══════════════════════════════════════════════════════
     #  TIER 2: yfinance (historical + fallback)
     # ═══════════════════════════════════════════════════════
@@ -248,7 +416,7 @@ class MarketDataService:
     def _init_tier2_yfinance(self):
         """Test yfinance connection."""
         if not YFINANCE_OK:
-            logger.warning("yfinance not installed — using mock mode.")
+            logger.warning("yfinance not installed - using mock mode.")
             return
 
         try:
@@ -259,8 +427,8 @@ class MarketDataService:
                 self._prices["NIFTY"] = price
                 self._price_timestamps["NIFTY"] = time.time()
                 self._tier = "YFINANCE"
-                logger.info("✅ TIER 2 ACTIVE: yfinance (NIFTY: %.2f)", price)
-                logger.warning("⚠️  yfinance has ~15min delay. For real-time, add Angel One credentials.")
+                logger.info("[OK] TIER 2 ACTIVE: yfinance (NIFTY: %.2f)", price)
+                logger.warning("[WARN] yfinance has ~15min delay. For real-time, add Angel One credentials.")
             else:
                 logger.warning("yfinance returned empty. Falling back to mock.")
         except Exception as e:
@@ -339,13 +507,30 @@ class MarketDataService:
     # ═══════════════════════════════════════════════════════
 
     def get_option_chain(self, symbol: str = "NIFTY", expiry: str = "") -> pd.DataFrame:
-        """Get option chain. NSE India → Mock fallback."""
+        """
+        Get option chain — Priority:
+        1. Angel One SmartAPI (real, live)
+        2. NSE India scraping (real, may be geo-blocked)
+        3. Mock (LAST RESORT — development only)
+        """
         key = f"{symbol}_{expiry}"
         ts = self._oc_ts.get(key)
-        if ts and (datetime.now() - ts).total_seconds() < 5:
+        if ts and (datetime.now(IST) - ts).total_seconds() < 30:
             return self._oc_cache.get(key, pd.DataFrame())
 
-        # NSE India scraping (rate-limited to avoid blocks)
+        # PRIORITY 1: Angel One SmartAPI (works everywhere)
+        if self._smart_api:
+            try:
+                df = self._fetch_angel_option_chain(symbol)
+                if not df.empty:
+                    self._oc_cache[key] = df
+                    self._oc_ts[key] = datetime.now(IST)
+                    self._data_source_log = "ANGEL_ONE_API"
+                    return df
+            except Exception as e:
+                logger.warning("Angel One OC failed: %s", e)
+
+        # PRIORITY 2: NSE India scraping (works from India IPs)
         if REQUESTS_OK:
             now = time.time()
             if now - self._nse_last_call >= self._nse_min_interval:
@@ -353,17 +538,20 @@ class MarketDataService:
                     df = self._fetch_nse_option_chain(symbol)
                     if not df.empty:
                         self._oc_cache[key] = df
-                        self._oc_ts[key] = datetime.now()
+                        self._oc_ts[key] = datetime.now(IST)
                         self._nse_last_call = now
+                        self._data_source_log = "NSE_INDIA"
                         return df
                 except Exception as e:
                     logger.debug("NSE OC failed: %s", e)
                     self._nse_last_call = now
 
-        # Fallback: mock chain
+        # FALLBACK: mock chain (DEV ONLY — logged as warning)
+        logger.warning("[MOCK] Using synthetic data — no live source available!")
         df = self._mock_option_chain(symbol)
         self._oc_cache[key] = df
-        self._oc_ts[key] = datetime.now()
+        self._oc_ts[key] = datetime.now(IST)
+        self._data_source_log = "MOCK"
         return df
 
     def _fetch_nse_option_chain(self, symbol: str) -> pd.DataFrame:
@@ -410,50 +598,6 @@ class MarketDataService:
         return df
 
     # ═══════════════════════════════════════════════════════
-    #  PUBLIC API: get_historical()
-    # ═══════════════════════════════════════════════════════
-
-    def get_historical(self, symbol: str = "NIFTY", period: str = "59d",
-                       interval: str = "5m") -> pd.DataFrame:
-        """Get historical OHLCV via yfinance (FREE).
-        
-        Note: yfinance limits intraday data to 60 days.
-        This method auto-clamps period for intraday intervals.
-        """
-        # Auto-clamp period for intraday intervals (yfinance 60-day limit)
-        intraday_intervals = ("1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h")
-        if interval in intraday_intervals and period in ("3mo", "6mo", "1y", "2y", "5y", "max"):
-            period = "59d"
-        cache_key = f"{symbol}_{period}_{interval}"
-        cached = self._hist_cache.get(cache_key)
-        cached_ts = self._hist_cache.get(f"{cache_key}_ts")
-        if cached is not None and cached_ts and (datetime.now() - cached_ts).total_seconds() < 300:
-            return cached
-
-        if not YFINANCE_OK:
-            return self._mock_historical()
-
-        try:
-            ticker_sym = YFINANCE_TICKERS.get(symbol.upper(), f"{symbol}.NS")
-            df = yf.Ticker(ticker_sym).history(period=period, interval=interval)
-            if df.empty:
-                return self._mock_historical()
-
-            df.columns = [c.lower() for c in df.columns]
-            for col in ["adj close", "dividends", "stock splits", "capital gains"]:
-                df = df.drop(columns=[col], errors="ignore")
-            df.index.name = "timestamp"
-
-            self._hist_cache[cache_key] = df
-            self._hist_cache[f"{cache_key}_ts"] = datetime.now()
-            logger.info("Historical data: %s | %d candles | %s", symbol, len(df), interval)
-            return df
-
-        except Exception as e:
-            logger.warning("yfinance historical failed: %s. Using mock.", e)
-            return self._mock_historical()
-
-    # ═══════════════════════════════════════════════════════
     #  MOCK DATA (when no API available)
     # ═══════════════════════════════════════════════════════
 
@@ -488,10 +632,11 @@ class MarketDataService:
         strikes = [atm + i * si for i in range(-10, 11)]
 
         rows = []
-        dte = config.DEFAULT_DAYS_TO_EXPIRY
+        dte = 7  # Weekly expiry
         t = max(dte / 365, 0.001)
-        r = config.RISK_FREE_RATE
+        r = 0.065  # Risk-free rate
         base_iv = 0.15 + random.uniform(-0.02, 0.02)
+        MIN_PREM = 0.50
 
         for s in strikes:
             moneyness = (s - bp) / bp
@@ -510,15 +655,11 @@ class MarketDataService:
             d2 = d1 - iv * math.sqrt(t)
             nd2, nd2_neg = _norm_cdf(d2), _norm_cdf(-d2)
 
-            ce_p = max(config.MIN_OPTION_PREMIUM,
-                       bp * nd1 - s * math.exp(-r * t) * nd2)
-            pe_p = max(config.MIN_OPTION_PREMIUM,
-                       s * math.exp(-r * t) * nd2_neg - bp * nd1_neg)
+            ce_p = max(MIN_PREM, bp * nd1 - s * math.exp(-r * t) * nd2)
+            pe_p = max(MIN_PREM, s * math.exp(-r * t) * nd2_neg - bp * nd1_neg)
 
-            ce_p = max(config.MIN_OPTION_PREMIUM,
-                       round(ce_p * (1 + random.uniform(-0.03, 0.03)), 2))
-            pe_p = max(config.MIN_OPTION_PREMIUM,
-                       round(pe_p * (1 + random.uniform(-0.03, 0.03)), 2))
+            ce_p = max(MIN_PREM, round(ce_p * (1 + random.uniform(-0.03, 0.03)), 2))
+            pe_p = max(MIN_PREM, round(pe_p * (1 + random.uniform(-0.03, 0.03)), 2))
 
             atm_prox = max(0.1, 1 - abs(moneyness) * 5)
             ce_oi = int(random.uniform(50000, 500000) * atm_prox)
@@ -546,55 +687,3 @@ class MarketDataService:
                 "pe_vega": round(bp * math.sqrt(t) * 0.01 * atm_prox, 2),
             })
         return pd.DataFrame(rows)
-
-    def _mock_historical(self) -> pd.DataFrame:
-        """Realistic mock OHLCV with market structure."""
-        dates = pd.date_range(end=datetime.now(), periods=5000, freq="5min")
-        market_dates = dates[
-            (dates.time >= datetime.strptime("09:15", "%H:%M").time()) &
-            (dates.time <= datetime.strptime("15:30", "%H:%M").time()) &
-            (dates.weekday < 5)
-        ]
-        if len(market_dates) < 100:
-            market_dates = dates[-2000:]
-
-        price = 22500.0
-        rows = []
-        regime = "UP"
-        regime_counter = 0
-        regime_len = random.randint(100, 300)
-        strength = random.uniform(0.3, 1.5)
-
-        for i, ts in enumerate(market_dates):
-            regime_counter += 1
-            if regime_counter >= regime_len:
-                regime = random.choice(["UP", "DOWN", "SIDE", "SIDE", "VOL"])
-                regime_len = random.randint(80, 250)
-                regime_counter = 0
-                strength = random.uniform(0.3, 1.5)
-
-            drift = {"UP": 0.0003, "DOWN": -0.0003, "VOL": 0, "SIDE": 0}.get(regime, 0) * strength
-            vol = {"UP": 0.0008, "DOWN": 0.001, "VOL": 0.002, "SIDE": 0.0005}.get(regime, 0.0005)
-            if regime in ("VOL", "SIDE"):
-                drift = random.uniform(-0.0002, 0.0002) if regime == "VOL" else 0
-
-            ret = random.gauss(drift, vol) + (22500 - price) / 22500 * 0.0001
-            o = price
-            c = price * (1 + ret)
-            bv = abs(random.gauss(0, vol * 1.5))
-            h = max(o, c) + abs(random.gauss(0, price * bv))
-            l = min(o, c) - abs(random.gauss(0, price * bv))
-            h, l = max(h, o, c), min(l, o, c)
-            l = max(l, price * 0.95)
-
-            hour = ts.hour
-            base_v = {9: 300000, 15: 200000, 10: 120000, 14: 120000}.get(hour, 70000)
-            v = max(5000, int(random.gauss(base_v, base_v * 0.3)))
-
-            rows.append({"open": round(o, 2), "high": round(h, 2),
-                         "low": round(l, 2), "close": round(c, 2), "volume": v})
-            price = c
-
-        df = pd.DataFrame(rows, index=market_dates[:len(rows)])
-        df.index.name = "timestamp"
-        return df

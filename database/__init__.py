@@ -1,1 +1,1 @@
-"""Database package — NeonDB (PostgreSQL) models and connection."""
+"""Database package — tables are created in run.py using psycopg2."""

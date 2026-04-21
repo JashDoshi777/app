@@ -1,6 +1,6 @@
 ---
-title: Options Trading Engine
-emoji: 📈
+title: NIFTY OI Tracker
+emoji: 📊
 colorFrom: blue
 colorTo: green
 sdk: docker
@@ -8,13 +8,14 @@ app_port: 7860
 pinned: true
 ---
 
-# Options Trading Engine
+# NIFTY OI Tracker — Live Option Chain Data
 
-Institutional-grade AI-powered options trading engine for Indian markets (NIFTY, BANKNIFTY).
+Real-time NIFTY option chain data logger with StockMojo-style dashboard.
 
 ## Features
-- Real-time market data via Angel One SmartAPI
-- Multi-layer signal generation (Technical + OI + Greeks + Sentiment)
-- Paper trading with ₹5,00,000 virtual capital
-- Backtesting engine with historical data
-- Advanced modules: VIX analysis, dynamic hedging, walk-forward optimization
+- Live option chain via Angel One SmartAPI (OI, LTP, Volume per strike)
+- Every-minute data logging to NeonDB PostgreSQL
+- PE-CE OI Difference table with color-coded signals
+- Smart OI Charts (Candlestick + OI Lines + PCR)
+- Price vs OI dual-axis charts with strike selector
+- IST timezone-aware market hours detection

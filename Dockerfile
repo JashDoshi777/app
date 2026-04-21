@@ -15,9 +15,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Download NLTK data for sentiment
-RUN python -c "import nltk; nltk.download('vader_lexicon', download_dir='/usr/share/nltk_data')"
-
 # Copy application code
 COPY . .
 
@@ -28,6 +25,8 @@ USER appuser
 
 # HuggingFace Spaces expects port 7860
 ENV PORT=7860
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONIOENCODING=utf-8
 EXPOSE 7860
 
 CMD ["python", "run.py"]

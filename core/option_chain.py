@@ -145,7 +145,7 @@ class OptionChainAnalyzer:
                 pe_w = itm_row.iloc[0]["pe_chg_oi"]
                 if ce_w != 0:
                     ratio = abs(pe_w / ce_w)
-                    snap.call_itm = ratio > config.ITM_RATIO_THRESHOLD or ce_w < 0
+                    snap.call_itm = ratio > 1.5 or ce_w < 0
 
         # ── Put ITM (2 strikes below) ─────────────────────
         if atm_idx - 2 >= 0:
@@ -156,7 +156,7 @@ class OptionChainAnalyzer:
                 ce_w = itm_row.iloc[0]["ce_chg_oi"]
                 if pe_w != 0:
                     ratio = abs(ce_w / pe_w)
-                    snap.put_itm = ratio > config.ITM_RATIO_THRESHOLD or pe_w < 0
+                    snap.put_itm = ratio > 1.5 or pe_w < 0
 
         # ── OI Boundaries (Resistance / Support) ─────────
         snap.max_call_oi = int(chain_df["ce_oi"].max())

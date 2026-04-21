@@ -3,332 +3,163 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Options Trading Engine</title>
-    <meta name="description" content="Institutional-grade Indian options trading algorithm with real-time analysis">
+    <title>NIFTY OI Tracker — Live</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script>
 </head>
 <body>
-<div class="app-container">
 
-    <!-- ═══ SIDEBAR ═══ -->
-    <aside class="sidebar">
-        <div class="sidebar-logo">OT</div>
-        <nav class="sidebar-nav">
-            <div class="nav-item active" data-section="dashboard" onclick="switchSection('dashboard')">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-                <span class="nav-tooltip">Dashboard</span>
-            </div>
-            <div class="nav-item" data-section="option-chain" onclick="switchSection('option-chain')">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
-                <span class="nav-tooltip">Option Chain</span>
-            </div>
-            <div class="nav-item" data-section="signals" onclick="switchSection('signals')">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="4"/></svg>
-                <span class="nav-tooltip">Signals</span>
-            </div>
-            <div class="nav-item" data-section="greeks" onclick="switchSection('greeks')">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
-                <span class="nav-tooltip">Greeks</span>
-            </div>
-            <div class="nav-item" data-section="sentiment" onclick="switchSection('sentiment')">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m8 17 4 4 4-4"/></svg>
-                <span class="nav-tooltip">Sentiment</span>
-            </div>
-            <div class="nav-item" data-section="trades" onclick="switchSection('trades')">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-                <span class="nav-tooltip">Trades</span>
-            </div>
-            <div class="nav-item" data-section="backtest" onclick="switchSection('backtest')">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-                <span class="nav-tooltip">Backtest</span>
-            </div>
-            <div class="nav-item" data-section="settings" onclick="switchSection('settings')">
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-                <span class="nav-tooltip">Settings</span>
-            </div>
-        </nav>
-    </aside>
+<!-- ═══ HEADER / TOOLBAR ═══ -->
+<header class="toolbar">
+    <div class="toolbar-left">
+        <div class="logo">
+            <span class="logo-icon">50</span>
+            <span class="logo-text">NIFTY</span>
+        </div>
+        <div class="expiry-badge" id="expiry-badge">--</div>
+    </div>
 
-    <!-- ═══ MAIN CONTENT ═══ -->
-    <main class="main-content">
+    <div class="toolbar-center">
+        <div class="tf-group">
+            <button class="tf-btn active" data-tf="1">1m</button>
+            <button class="tf-btn" data-tf="3">3m</button>
+            <button class="tf-btn" data-tf="5">5m</button>
+            <button class="tf-btn" data-tf="15">15m</button>
+            <button class="tf-btn" data-tf="60">1h</button>
+        </div>
+        <div class="mode-toggle">
+            <button class="mode-btn active" data-mode="live" id="btn-live">Live</button>
+            <button class="mode-btn" data-mode="historical" id="btn-historical">Historical</button>
+        </div>
+    </div>
 
-        <!-- Header -->
-        <header class="page-header">
-            <h1 class="page-title" id="page-title">Dashboard</h1>
-            <div class="header-meta">
-                <div class="market-badge closed" id="market-badge">
-                    <span class="dot"></span>
-                    <span id="market-status-text">CLOSED</span>
+    <div class="toolbar-right">
+        <div class="live-indicator" id="live-dot">
+            <span class="dot"></span>
+            <span class="live-time" id="live-time">--:--:--</span>
+        </div>
+        <span class="market-badge" id="market-badge">CLOSED</span>
+    </div>
+</header>
+
+<!-- ═══ TAB NAVIGATION ═══ -->
+<nav class="tab-nav">
+    <button class="tab-btn active" data-tab="oi-table">OI Data</button>
+    <button class="tab-btn" data-tab="smart-oi">Smart OI</button>
+    <button class="tab-btn" data-tab="price-oi">Price vs OI</button>
+</nav>
+
+<!-- ═══ TAB 1: OI DATA TABLE ═══ -->
+<section class="tab-panel active" id="panel-oi-table">
+    <div class="table-header-bar">
+        <div class="table-info">
+            <span class="underlying-price" id="underlying-price">--</span>
+            <span class="table-label">NIFTY Spot</span>
+        </div>
+        <div class="table-filters">
+            <label class="filter-label">Total OI
+                <select id="oi-display-mode">
+                    <option value="total">Total</option>
+                    <option value="change">OI Change (Day)</option>
+                </select>
+            </label>
+        </div>
+    </div>
+    <div class="table-container">
+        <table class="oi-table" id="oi-data-table">
+            <thead>
+                <tr>
+                    <th rowspan="2" class="col-time">Time</th>
+                    <th colspan="3" class="col-group put-header">Put OI</th>
+                    <th colspan="3" class="col-group call-header">Call OI</th>
+                    <th colspan="2" class="col-group diff-header">PE - CE OI</th>
+                    <th rowspan="2" class="col-pcr">PCR</th>
+                    <th colspan="3" class="col-group future-header">Future</th>
+                    <th rowspan="2" class="col-sentiment">Signal</th>
+                </tr>
+                <tr>
+                    <!-- Put OI sub -->
+                    <th class="sub">Total</th>
+                    <th class="sub">Chg (Day)</th>
+                    <th class="sub">Change</th>
+                    <!-- Call OI sub -->
+                    <th class="sub">Total</th>
+                    <th class="sub">Chg (Day)</th>
+                    <th class="sub">Change</th>
+                    <!-- PE-CE sub -->
+                    <th class="sub">Total</th>
+                    <th class="sub">Chg (Day)</th>
+                    <!-- Future sub -->
+                    <th class="sub">LTP</th>
+                    <th class="sub">Straddle</th>
+                    <th class="sub">ATM</th>
+                </tr>
+            </thead>
+            <tbody id="oi-table-body">
+                <tr><td colspan="14" class="empty-msg">Waiting for market data...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<!-- ═══ TAB 2: SMART OI CHARTS ═══ -->
+<section class="tab-panel" id="panel-smart-oi">
+    <div class="chart-grid-2col">
+        <div class="chart-card">
+            <div class="chart-title">NIFTY &nbsp;<span class="tag green">● Smart OI</span></div>
+            <canvas id="chart-candle"></canvas>
+        </div>
+        <div class="chart-col-right">
+            <div class="chart-card">
+                <div class="chart-title">
+                    <span class="tag pink">● Put</span>
+                    <span class="tag green">● Call</span>
+                    <span class="tag purple">● PE-CE</span>
                 </div>
-                <span class="live-time" id="live-time">--:--:--</span>
+                <canvas id="chart-oi-lines"></canvas>
             </div>
-        </header>
-
-        <!-- ═══ DASHBOARD SECTION ═══ -->
-        <div class="section active" id="sec-dashboard">
-            <div class="stat-grid" id="stat-grid">
-                <div class="stat-card">
-                    <div class="stat-label">Total P&L</div>
-                    <div class="stat-value neutral" id="stat-pnl">0.00</div>
-                    <div class="stat-sub" id="stat-pnl-pct">0.00%</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Available Capital</div>
-                    <div class="stat-value neutral" id="stat-capital">10,000</div>
-                    <div class="stat-sub">of 5,00,000</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Open Positions</div>
-                    <div class="stat-value neutral" id="stat-positions">0</div>
-                    <div class="stat-sub" id="stat-daily-trades">0 trades today</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Win Rate</div>
-                    <div class="stat-value neutral" id="stat-winrate">0%</div>
-                    <div class="stat-sub" id="stat-total-trades">0 total trades</div>
-                </div>
+            <div class="chart-card">
+                <div class="chart-title"><span class="tag cyan">● PCR</span></div>
+                <canvas id="chart-pcr"></canvas>
             </div>
+        </div>
+    </div>
+</section>
 
-            <div class="grid-2" style="margin-bottom: 24px;">
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Equity Curve</span>
-                    </div>
-                    <div class="chart-container">
-                        <canvas id="equity-chart"></canvas>
-                    </div>
-                </div>
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Signal Distribution</span>
-                    </div>
-                    <div class="chart-container">
-                        <canvas id="signal-chart"></canvas>
-                    </div>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Active Positions</span>
-                </div>
-                <div class="data-table-wrapper">
-                    <table class="data-table" id="positions-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th><th>Type</th><th>Strike</th><th>Side</th>
-                                <th>Entry</th><th>Current</th><th>P&L</th><th>Strategy</th>
-                            </tr>
-                        </thead>
-                        <tbody id="positions-body">
-                            <tr><td colspan="8" class="empty-state">No open positions</td></tr>
-                        </tbody>
-                    </table>
+<!-- ═══ TAB 3: PRICE vs OI ═══ -->
+<section class="tab-panel" id="panel-price-oi">
+    <div class="price-oi-layout">
+        <div class="strike-sidebar">
+            <h3>Settings</h3>
+            <div class="strike-selector">
+                <label>Select Strike</label>
+                <div class="strike-list" id="strike-list">
+                    <div class="strike-item active">--</div>
                 </div>
             </div>
         </div>
-
-        <!-- ═══ OPTION CHAIN SECTION ═══ -->
-        <div class="section" id="sec-option-chain">
-            <div class="stat-grid">
-                <div class="stat-card">
-                    <div class="stat-label">Underlying</div>
-                    <div class="stat-value neutral" id="oc-underlying">--</div>
+        <div class="price-oi-charts">
+            <div class="chart-grid-2col-equal">
+                <div class="chart-card">
+                    <div class="chart-title">📈 Call Price vs OI</div>
+                    <canvas id="chart-call-price-oi"></canvas>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">PCR</div>
-                    <div class="stat-value neutral" id="oc-pcr">--</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Max Pain</div>
-                    <div class="stat-value neutral" id="oc-maxpain">--</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">OI Trend</div>
-                    <div class="stat-value neutral" id="oc-trend">--</div>
+                <div class="chart-card">
+                    <div class="chart-title">📉 Put Price vs OI</div>
+                    <canvas id="chart-put-price-oi"></canvas>
                 </div>
             </div>
-
-            <div class="grid-2" style="margin-bottom: 24px;">
-                <div class="card">
-                    <div class="card-header"><span class="card-title">OI Boundaries</span></div>
-                    <div id="oi-boundaries">
-                        <p style="color:var(--text-secondary);font-size:13px;">
-                            <strong style="color:var(--red);">Resistance:</strong> <span id="oc-resistance">--</span><br>
-                            <strong style="color:var(--green);">Support:</strong> <span id="oc-support">--</span>
-                        </p>
-                        <div style="margin-top:12px;">
-                            <span class="stat-label">Call Exits</span> <span class="badge neutral" id="oc-call-exits">--</span>&nbsp;
-                            <span class="stat-label">Put Exits</span> <span class="badge neutral" id="oc-put-exits">--</span>&nbsp;
-                            <span class="stat-label">Call ITM</span> <span class="badge neutral" id="oc-call-itm">--</span>&nbsp;
-                            <span class="stat-label">Put ITM</span> <span class="badge neutral" id="oc-put-itm">--</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="card">
-                    <div class="card-header"><span class="card-title">OI Heatmap</span></div>
-                    <div class="chart-container"><canvas id="oi-chart"></canvas></div>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header"><span class="card-title">Live Option Chain</span></div>
-                <div class="data-table-wrapper" style="max-height:500px;overflow-y:auto;">
-                    <table class="data-table oi-chain-table" id="chain-table">
-                        <thead>
-                            <tr>
-                                <th class="ce-cell">CE OI</th><th class="ce-cell">CE Chg</th>
-                                <th class="ce-cell">CE IV</th><th class="ce-cell">CE LTP</th>
-                                <th class="strike-cell">Strike</th>
-                                <th class="pe-cell">PE LTP</th><th class="pe-cell">PE IV</th>
-                                <th class="pe-cell">PE Chg</th><th class="pe-cell">PE OI</th>
-                            </tr>
-                        </thead>
-                        <tbody id="chain-body"></tbody>
-                    </table>
-                </div>
+            <div class="chart-card full-width">
+                <div class="chart-title">🔷 Straddle Price</div>
+                <canvas id="chart-straddle"></canvas>
             </div>
         </div>
-
-        <!-- ═══ SIGNALS SECTION ═══ -->
-        <div class="section" id="sec-signals">
-            <div class="card" style="margin-bottom:24px;">
-                <div class="card-header"><span class="card-title">Signal History</span></div>
-                <div class="data-table-wrapper" style="max-height:600px;overflow-y:auto;">
-                    <table class="data-table" id="signals-table">
-                        <thead>
-                            <tr>
-                                <th>Time</th><th>Symbol</th><th>Direction</th><th>Score</th>
-                                <th>Confidence</th><th>Regime</th><th>Strategy</th><th>Actionable</th>
-                            </tr>
-                        </thead>
-                        <tbody id="signals-body">
-                            <tr><td colspan="8" class="empty-state">No signals yet</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <!-- ═══ GREEKS SECTION ═══ -->
-        <div class="section" id="sec-greeks">
-            <div class="stat-grid">
-                <div class="stat-card"><div class="stat-label">Portfolio Delta</div><div class="stat-value neutral" id="g-delta">0</div></div>
-                <div class="stat-card"><div class="stat-label">Portfolio Gamma</div><div class="stat-value neutral" id="g-gamma">0</div></div>
-                <div class="stat-card"><div class="stat-label">Portfolio Theta</div><div class="stat-value neutral" id="g-theta">0</div></div>
-                <div class="stat-card"><div class="stat-label">Portfolio Vega</div><div class="stat-value neutral" id="g-vega">0</div></div>
-            </div>
-            <div class="card">
-                <div class="card-header"><span class="card-title">Greeks Radar</span></div>
-                <div class="chart-container"><canvas id="greeks-chart"></canvas></div>
-            </div>
-        </div>
-
-        <!-- ═══ SENTIMENT SECTION ═══ -->
-        <div class="section" id="sec-sentiment">
-            <div class="stat-grid">
-                <div class="stat-card"><div class="stat-label">Overall Sentiment</div><div class="stat-value neutral" id="sent-score">0.00</div><div class="stat-sub" id="sent-label">NEUTRAL</div></div>
-                <div class="stat-card"><div class="stat-label">Confidence</div><div class="stat-value neutral" id="sent-confidence">0%</div></div>
-                <div class="stat-card"><div class="stat-label">Sources Analyzed</div><div class="stat-value neutral" id="sent-sources">0</div></div>
-                <div class="stat-card"><div class="stat-label">Momentum</div><div class="stat-value neutral" id="sent-momentum">STABLE</div></div>
-            </div>
-            <div class="card">
-                <div class="card-header"><span class="card-title">Sentiment Gauge</span></div>
-                <div class="gauge-container" style="padding:24px 0;">
-                    <div style="display:flex;justify-content:space-between;width:100%;font-size:12px;color:var(--text-tertiary);">
-                        <span>Bearish</span><span>Neutral</span><span>Bullish</span>
-                    </div>
-                    <div class="gauge-bar" style="height:12px;">
-                        <div class="gauge-fill green" id="sent-gauge" style="width:50%;"></div>
-                    </div>
-                </div>
-            </div>
-            <div class="card" style="margin-top:16px;">
-                <div class="card-header"><span class="card-title">Recent News & Social</span></div>
-                <div id="sent-feed" style="max-height:400px;overflow-y:auto;"></div>
-            </div>
-        </div>
-
-        <!-- ═══ TRADES SECTION ═══ -->
-        <div class="section" id="sec-trades">
-            <div class="card">
-                <div class="card-header"><span class="card-title">Trade Journal</span></div>
-                <div class="data-table-wrapper" style="max-height:600px;overflow-y:auto;">
-                    <table class="data-table" id="trades-table">
-                        <thead>
-                            <tr>
-                                <th>#</th><th>Symbol</th><th>Type</th><th>Strike</th>
-                                <th>Side</th><th>Entry</th><th>Exit</th><th>P&L</th>
-                                <th>Strategy</th><th>Reason</th>
-                            </tr>
-                        </thead>
-                        <tbody id="trades-body">
-                            <tr><td colspan="10" class="empty-state">No trades yet</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <!-- ═══ BACKTEST SECTION ═══ -->
-        <div class="section" id="sec-backtest">
-            <div style="margin-bottom:24px;">
-                <button class="btn btn-primary" id="run-backtest-btn" onclick="runBacktest()">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                    Run Backtest
-                </button>
-            </div>
-            <div id="backtest-results" style="display:none;">
-                <div class="stat-grid" id="bt-stats"></div>
-                <div class="card" style="margin-top:16px;">
-                    <div class="card-header"><span class="card-title">Backtest Equity Curve</span></div>
-                    <div class="chart-container"><canvas id="bt-equity-chart"></canvas></div>
-                </div>
-                <div class="card" style="margin-top:16px;">
-                    <div class="card-header"><span class="card-title">Backtest Trades</span></div>
-                    <div class="data-table-wrapper" style="max-height:400px;overflow-y:auto;">
-                        <table class="data-table">
-                            <thead><tr><th>#</th><th>Strategy</th><th>Entry Price</th><th>Exit Price</th><th>P&L</th><th>Reason</th></tr></thead>
-                            <tbody id="bt-trades-body"></tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- ═══ SETTINGS SECTION ═══ -->
-        <div class="section" id="sec-settings">
-            <div class="card">
-                <div class="card-header"><span class="card-title">Configuration</span></div>
-                <div style="display:grid;gap:20px;max-width:500px;">
-                    <div>
-                        <label class="stat-label" style="display:block;margin-bottom:6px;">Paper Trading Capital</label>
-                        <input type="text" value="5,00,000" readonly style="width:100%;padding:10px 14px;background:var(--bg-input);border:1px solid var(--border-medium);border-radius:var(--radius-sm);color:var(--text-primary);font-family:inherit;font-size:14px;">
-                    </div>
-                    <div>
-                        <label class="stat-label" style="display:block;margin-bottom:6px;">Max Risk Per Trade</label>
-                        <input type="text" value="2%" readonly style="width:100%;padding:10px 14px;background:var(--bg-input);border:1px solid var(--border-medium);border-radius:var(--radius-sm);color:var(--text-primary);font-family:inherit;font-size:14px;">
-                    </div>
-                    <div>
-                        <label class="stat-label" style="display:block;margin-bottom:6px;">Max Daily Drawdown</label>
-                        <input type="text" value="3%" readonly style="width:100%;padding:10px 14px;background:var(--bg-input);border:1px solid var(--border-medium);border-radius:var(--radius-sm);color:var(--text-primary);font-family:inherit;font-size:14px;">
-                    </div>
-                    <div>
-                        <label class="stat-label" style="display:block;margin-bottom:6px;">DhanHQ Status</label>
-                        <span class="badge neutral" id="dhan-status">Checking...</span>
-                    </div>
-                    <div>
-                        <label class="stat-label" style="display:block;margin-bottom:6px;">Database Status</label>
-                        <span class="badge neutral" id="db-status">Checking...</span>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-    </main>
-</div>
+    </div>
+</section>
 
 <script src="/static/js/app.js"></script>
 </body>

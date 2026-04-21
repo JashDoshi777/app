@@ -1,665 +1,550 @@
 /* ═══════════════════════════════════════════════════════════
-   OPTIONS TRADING ENGINE — Frontend Logic
-   Real-time polling, charts, data rendering
+   NIFTY OI Tracker — Interactive Dashboard JS
    ═══════════════════════════════════════════════════════════ */
 
+// ─── Chart Defaults ─────────────────────────────────────
+Chart.defaults.color = 'rgba(232,234,237,0.5)';
+Chart.defaults.borderColor = 'rgba(255,255,255,0.06)';
+Chart.defaults.font.family = "'Inter', sans-serif";
+Chart.defaults.font.size = 11;
+Chart.defaults.plugins.legend.labels.usePointStyle = true;
+Chart.defaults.plugins.legend.labels.pointStyleWidth = 8;
+Chart.defaults.animation = { duration: 400 };
+
+const COLORS = {
+    green: '#26a69a', red: '#ef5350', blue: '#42a5f5',
+    purple: '#ab47bc', cyan: '#26c6da', pink: '#ec407a',
+    orange: '#ffa726', greenBright: '#00e676',
+};
+
 // ─── State ──────────────────────────────────────────────
-let currentSection = 'dashboard';
+let currentTab = 'oi-table';
+let selectedStrike = 0;
 let charts = {};
 let refreshInterval = null;
 
-// ─── Section Navigation ─────────────────────────────────
-function switchSection(section) {
-    document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+// ─── Init ───────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    initTabs();
+    initTimeframeButtons();
+    initModeButtons();
+    startClock();
+    checkMarketStatus();
+    loadAllData();
+    refreshInterval = setInterval(loadAllData, 60000);
+    setInterval(checkMarketStatus, 10000);
+});
 
-    const secEl = document.getElementById(`sec-${section}`);
-    const navEl = document.querySelector(`[data-section="${section}"]`);
+// ═══ TABS ═══════════════════════════════════════════════
+function initTabs() {
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            btn.classList.add('active');
+            currentTab = btn.dataset.tab;
+            document.getElementById(`panel-${currentTab}`).classList.add('active');
+            loadAllData();
+        });
+    });
+}
 
-    if (secEl) secEl.classList.add('active');
-    if (navEl) navEl.classList.add('active');
+function initTimeframeButtons() {
+    document.querySelectorAll('.tf-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            loadAllData();
+        });
+    });
+}
 
-    currentSection = section;
+function initModeButtons() {
+    document.querySelectorAll('.mode-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            loadAllData();
+        });
+    });
+}
 
-    const titles = {
-        'dashboard': 'Dashboard', 'option-chain': 'Option Chain',
-        'signals': 'Signals', 'greeks': 'Greeks', 'sentiment': 'Sentiment',
-        'trades': 'Trade Journal', 'backtest': 'Backtest', 'settings': 'Settings'
+// ═══ CLOCK & STATUS ═════════════════════════════════════
+function startClock() {
+    const update = () => {
+        const now = new Date();
+        const ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000) - (now.getTimezoneOffset() * 60 * 1000));
+        document.getElementById('live-time').textContent =
+            ist.toLocaleTimeString('en-IN', { hour12: false });
     };
-    document.getElementById('page-title').textContent = titles[section] || 'Dashboard';
-
-    // Load section data
-    loadSectionData(section);
+    update();
+    setInterval(update, 1000);
 }
 
-// ─── Clock ──────────────────────────────────────────────
-function updateClock() {
-    const now = new Date();
-    const h = String(now.getHours()).padStart(2, '0');
-    const m = String(now.getMinutes()).padStart(2, '0');
-    const s = String(now.getSeconds()).padStart(2, '0');
-    document.getElementById('live-time').textContent = `${h}:${m}:${s}`;
-}
-
-// ─── API Fetcher ────────────────────────────────────────
-async function api(endpoint) {
+async function checkMarketStatus() {
     try {
-        const res = await fetch(`/api/${endpoint}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return await res.json();
-    } catch (e) {
-        console.error(`API error [${endpoint}]:`, e);
-        return null;
-    }
+        const res = await fetch('/api/market-status');
+        const data = await res.json();
+        const badge = document.getElementById('market-badge');
+        if (data.is_open) {
+            badge.textContent = 'LIVE';
+            badge.className = 'market-badge open';
+        } else {
+            badge.textContent = 'CLOSED';
+            badge.className = 'market-badge closed';
+        }
+        if (data.date) {
+            const src = data.data_source || 'UNKNOWN';
+            const db = data.db_connected ? ' | DB:ON' : ' | DB:OFF';
+            document.getElementById('expiry-badge').textContent =
+                data.date + ' | ' + src + db;
+        }
+    } catch (e) { console.error(e); }
 }
 
-// ─── Format Helpers ─────────────────────────────────────
-function formatCurrency(val) {
-    const n = parseFloat(val) || 0;
-    const prefix = n >= 0 ? '' : '-';
-    return `${prefix}\u20B9${Math.abs(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+// ═══ DATA LOADING ═══════════════════════════════════════
+async function loadAllData() {
+    if (currentTab === 'oi-table') await loadOITable();
+    if (currentTab === 'smart-oi') await loadSmartOI();
+    if (currentTab === 'price-oi') await loadPriceVsOI();
 }
 
-function formatNum(val, dec = 2) {
-    return (parseFloat(val) || 0).toFixed(dec);
-}
+// ─── OI TABLE ───────────────────────────────────────────
+async function loadOITable() {
+    try {
+        const res = await fetch('/api/oi-table');
+        const data = await res.json();
+        if (!data.rows || !data.rows.length) return;
 
-function pnlClass(val) {
-    const n = parseFloat(val) || 0;
-    return n > 0 ? 'positive' : n < 0 ? 'negative' : 'neutral';
-}
+        // Update underlying price
+        const raw = data.rows[0]._raw;
+        if (raw) {
+            document.getElementById('underlying-price').textContent = raw.underlying?.toFixed(2) || '--';
+        }
 
-function badgeClass(label) {
-    const l = (label || '').toLowerCase().replace('_', '-');
-    if (['bullish', 'buy', 'strong-buy', 'strong_buy'].includes(l)) return 'bullish';
-    if (['bearish', 'sell', 'strong-sell', 'strong_sell'].includes(l)) return 'bearish';
-    if (['sideways'].includes(l)) return 'sideways';
-    return 'neutral';
-}
+        const tbody = document.getElementById('oi-table-body');
+        tbody.innerHTML = data.rows.map(r => {
+            const raw = r._raw || {};
+            const peDiff = raw.pe_ce_diff || 0;
+            const signal = raw.pcr > 1.2 ? 'up' : raw.pcr < 0.8 ? 'down' : 'side';
+            const signalText = raw.pcr > 1.2 ? '↑ LU' : raw.pcr < 0.8 ? '↓ SC' : '→ S';
 
-// ─── Load Section Data ──────────────────────────────────
-async function loadSectionData(section) {
-    switch (section) {
-        case 'dashboard': await loadDashboard(); break;
-        case 'option-chain': await loadOptionChain(); break;
-        case 'signals': await loadSignals(); break;
-        case 'greeks': await loadGreeks(); break;
-        case 'sentiment': await loadSentiment(); break;
-        case 'trades': await loadTrades(); break;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
-//  DASHBOARD
-// ═══════════════════════════════════════════════════════════
-
-async function loadDashboard() {
-    const data = await api('dashboard');
-    if (!data || !data.portfolio) return;
-
-    const p = data.portfolio;
-
-    // Market status
-    const badge = document.getElementById('market-badge');
-    const statusText = document.getElementById('market-status-text');
-    if (data.market_status === 'OPEN') {
-        badge.className = 'market-badge open';
-        statusText.textContent = 'LIVE';
-    } else {
-        badge.className = 'market-badge closed';
-        statusText.textContent = 'CLOSED';
-    }
-
-    // Stats
-    document.getElementById('stat-pnl').textContent = formatCurrency(p.total_pnl);
-    document.getElementById('stat-pnl').className = `stat-value ${pnlClass(p.total_pnl)}`;
-    document.getElementById('stat-pnl-pct').textContent = `${formatNum(p.total_pnl_pct)}%`;
-
-    document.getElementById('stat-capital').textContent = formatCurrency(p.available_capital);
-    document.getElementById('stat-positions').textContent = p.open_positions;
-    document.getElementById('stat-daily-trades').textContent = `${p.daily_trades} trades today`;
-    document.getElementById('stat-winrate').textContent = `${p.win_rate}%`;
-    document.getElementById('stat-total-trades').textContent = `${p.total_closed_trades} total trades`;
-
-    // Positions table
-    const tbody = document.getElementById('positions-body');
-    if (p.positions && p.positions.length > 0) {
-        tbody.innerHTML = p.positions.map(pos => `
-            <tr>
-                <td>${pos.symbol}</td>
-                <td>${pos.option_type}</td>
-                <td>${pos.strike}</td>
-                <td><span class="badge ${pos.side === 'BUY' ? 'bullish' : 'bearish'}">${pos.side}</span></td>
-                <td>${formatCurrency(pos.entry_price)}</td>
-                <td>${formatCurrency(pos.current_price)}</td>
-                <td style="color:var(--${pos.unrealized_pnl >= 0 ? 'green' : 'red'})">${formatCurrency(pos.unrealized_pnl)}</td>
-                <td>${pos.strategy}</td>
-            </tr>
-        `).join('');
-    } else {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No open positions</td></tr>';
-    }
-
-    // ── Equity Curve Chart ───────────────────────────
-    const eqCtx = document.getElementById('equity-chart');
-    if (eqCtx) {
-        if (charts.dashEquity) charts.dashEquity.destroy();
-
-        // Build equity history from closed trades
-        const trades = data.closed_trades || [];
-        let running = p.initial_capital || 500000;
-        const eqData = [running];
-        trades.forEach(t => { running += (t.net_pnl || 0); eqData.push(running); });
-
-        // If no trades yet, show flat line at initial capital
-        if (eqData.length < 2) eqData.push(running);
-
-        charts.dashEquity = new Chart(eqCtx, {
-            type: 'line',
-            data: {
-                labels: eqData.map((_, i) => i === 0 ? 'Start' : `Trade ${i}`),
-                datasets: [{
-                    label: 'Equity',
-                    data: eqData,
-                    borderColor: eqData[eqData.length-1] >= eqData[0] ? 'rgba(48, 209, 88, 0.8)' : 'rgba(255, 69, 58, 0.8)',
-                    backgroundColor: eqData[eqData.length-1] >= eqData[0] ? 'rgba(48, 209, 88, 0.08)' : 'rgba(255, 69, 58, 0.08)',
-                    fill: true, borderWidth: 2, pointRadius: 0,
-                    pointHoverRadius: 6, pointHoverBackgroundColor: '#fff',
-                    pointHoverBorderWidth: 2, tension: 0.3,
-                }]
-            },
-            options: {
-                responsive: true, maintainAspectRatio: false,
-                interaction: { mode: 'index', intersect: false },
-                plugins: {
-                    legend: { display: false },
-                    tooltip: {
-                        enabled: true,
-                        backgroundColor: 'rgba(28, 28, 30, 0.95)',
-                        titleColor: '#f5f5f7', bodyColor: '#f5f5f7',
-                        borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1,
-                        padding: 12, cornerRadius: 8, displayColors: false,
-                        titleFont: { family: 'Inter', size: 13, weight: '600' },
-                        bodyFont: { family: 'Inter', size: 12 },
-                        callbacks: {
-                            title: (items) => items[0].label,
-                            label: (item) => `\u20b9${parseFloat(item.raw).toLocaleString('en-IN', {minimumFractionDigits: 2})}`,
-                        }
-                    }
-                },
-                scales: {
-                    x: { display: false },
-                    y: {
-                        ticks: { color: 'rgba(245,245,247,0.35)', font: { size: 10 }, callback: (v) => '\u20b9' + (v/1000).toFixed(0) + 'K' },
-                        grid: { color: 'rgba(255,255,255,0.04)' },
-                    },
-                }
-            }
-        });
-    }
-
-    // ── Signal Distribution Chart ────────────────────
-    const sigCtx = document.getElementById('signal-chart');
-    if (sigCtx) {
-        if (charts.dashSignal) charts.dashSignal.destroy();
-
-        const sigData = data.signal_distribution || { bullish: 0, bearish: 0, neutral: 0 };
-        const vals = [sigData.bullish || 0, sigData.bearish || 0, sigData.neutral || 1];
-        const total = vals.reduce((a, b) => a + b, 0);
-
-        charts.dashSignal = new Chart(sigCtx, {
-            type: 'doughnut',
-            data: {
-                labels: ['Bullish', 'Bearish', 'Neutral'],
-                datasets: [{
-                    data: vals,
-                    backgroundColor: ['rgba(48, 209, 88, 0.7)', 'rgba(255, 69, 58, 0.7)', 'rgba(142, 142, 147, 0.5)'],
-                    hoverBackgroundColor: ['rgba(48, 209, 88, 1)', 'rgba(255, 69, 58, 1)', 'rgba(142, 142, 147, 0.8)'],
-                    borderColor: 'rgba(28, 28, 30, 1)',
-                    borderWidth: 3,
-                    hoverOffset: 8,
-                }]
-            },
-            options: {
-                responsive: true, maintainAspectRatio: false,
-                cutout: '65%',
-                plugins: {
-                    legend: { position: 'bottom', labels: { color: 'rgba(245,245,247,0.6)', font: { family: 'Inter', size: 11 }, padding: 16, usePointStyle: true, pointStyle: 'circle' } },
-                    tooltip: {
-                        enabled: true,
-                        backgroundColor: 'rgba(28, 28, 30, 0.95)',
-                        titleColor: '#f5f5f7', bodyColor: '#f5f5f7',
-                        borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1,
-                        padding: 12, cornerRadius: 8,
-                        titleFont: { family: 'Inter', size: 13, weight: '600' },
-                        bodyFont: { family: 'Inter', size: 12 },
-                        callbacks: {
-                            label: (item) => `${item.label}: ${item.raw} (${(item.raw / total * 100).toFixed(1)}%)`,
-                        }
-                    }
-                }
-            }
-        });
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
-//  OPTION CHAIN
-// ═══════════════════════════════════════════════════════════
-
-async function loadOptionChain() {
-    const data = await api('option-chain');
-    if (!data) return;
-
-    document.getElementById('oc-underlying').textContent = formatCurrency(data.underlying_price);
-
-    // Show data freshness notice
-    const trendEl = document.getElementById('oc-trend');
-    const a = data.analysis || {};
-    document.getElementById('oc-pcr').textContent = formatNum(a.pcr, 4);
-    document.getElementById('oc-maxpain').textContent = a.max_pain || '--';
-
-    if (data.data_freshness === 'LAST_CLOSE') {
-        trendEl.textContent = (a.trend || '--') + ' (Last Close)';
-        trendEl.className = `stat-value neutral`;
-    } else {
-        trendEl.textContent = a.trend || '--';
-        trendEl.className = `stat-value ${badgeClass(a.trend)}`;
-    }
-    document.getElementById('oc-resistance').textContent = a.resistance || '--';
-    document.getElementById('oc-support').textContent = a.support || '--';
-
-    const exitBadge = (val) => `<span class="badge ${val ? 'bullish' : 'neutral'}">${val ? 'YES' : 'NO'}</span>`;
-    document.getElementById('oc-call-exits').outerHTML = exitBadge(a.call_exits);
-    document.getElementById('oc-put-exits').outerHTML = exitBadge(a.put_exits);
-    document.getElementById('oc-call-itm').outerHTML = exitBadge(a.call_itm);
-    document.getElementById('oc-put-itm').outerHTML = exitBadge(a.put_itm);
-
-    // Chain table
-    const tbody = document.getElementById('chain-body');
-    if (data.chain && data.chain.length > 0) {
-        const maxOI = Math.max(...data.chain.map(r => Math.max(r.ce_oi || 0, r.pe_oi || 0)), 1);
-        tbody.innerHTML = data.chain.map(r => {
-            const ceBar = Math.round((r.ce_oi || 0) / maxOI * 80);
-            const peBar = Math.round((r.pe_oi || 0) / maxOI * 80);
-            const ceChgColor = (r.ce_chg_oi || 0) > 0 ? 'var(--red)' : 'var(--green)';
-            const peChgColor = (r.pe_chg_oi || 0) > 0 ? 'var(--green)' : 'var(--red)';
             return `<tr>
-                <td class="ce-cell">${(r.ce_oi||0).toLocaleString()} <span class="oi-bar ce" style="width:${ceBar}px"></span></td>
-                <td class="ce-cell" style="color:${ceChgColor}">${(r.ce_chg_oi||0).toLocaleString()}</td>
-                <td class="ce-cell">${formatNum(r.ce_iv)}</td>
-                <td class="ce-cell">${formatNum(r.ce_ltp)}</td>
-                <td class="strike-cell">${r.strike}</td>
-                <td class="pe-cell">${formatNum(r.pe_ltp)}</td>
-                <td class="pe-cell">${formatNum(r.pe_iv)}</td>
-                <td class="pe-cell" style="color:${peChgColor}">${(r.pe_chg_oi||0).toLocaleString()}</td>
-                <td class="pe-cell"><span class="oi-bar pe" style="width:${peBar}px"></span> ${(r.pe_oi||0).toLocaleString()}</td>
+                <td class="col-time">${r.time}</td>
+                <td class="${valClass(raw.total_pe_oi)}">${r.pe_oi_total}</td>
+                <td class="${valClass(raw.pe_oi_change_day)}">${r.pe_oi_change_day}</td>
+                <td class="${valClass(raw.pe_oi_change)}">${r.pe_oi_change}</td>
+                <td class="${valClass(raw.total_ce_oi)}">${r.ce_oi_total}</td>
+                <td class="${valClass(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>
+                <td class="${valClass(raw.ce_oi_change)}">${r.ce_oi_change}</td>
+                <td class="${peDiff > 0 ? 'val-pos' : 'val-neg'}">${r.pe_ce_total}</td>
+                <td class="${raw.pe_ce_diff_change > 0 ? 'val-pos' : 'val-neg'}">${r.pe_ce_change}</td>
+                <td>${r.pcr?.toFixed(2)}</td>
+                <td class="val-neutral">${r.future_ltp}</td>
+                <td class="val-neutral">${r.straddle}</td>
+                <td class="val-neutral">${r.atm_strike}</td>
+                <td><span class="signal-badge signal-${signal}">${signalText}</span></td>
             </tr>`;
         }).join('');
-    }
 
-    // OI Chart
-    renderOIChart(data.chain || []);
+    } catch (e) { console.error('OI Table error:', e); }
 }
 
-function renderOIChart(chain) {
-    const ctx = document.getElementById('oi-chart');
-    if (!ctx) return;
+function valClass(v) {
+    if (!v || v === 0) return 'val-neutral';
+    return v > 0 ? 'val-pos' : 'val-neg';
+}
 
-    if (charts.oi) charts.oi.destroy();
+// ─── SMART OI CHARTS ────────────────────────────────────
+async function loadSmartOI() {
+    try {
+        const [oiRes, candleRes] = await Promise.all([
+            fetch('/api/oi-chart'),
+            fetch('/api/candles'),
+        ]);
+        const oiData = await oiRes.json();
+        const candleData = await candleRes.json();
 
-    const labels = chain.map(r => r.strike);
-    const ceOI = chain.map(r => r.ce_oi || 0);
-    const peOI = chain.map(r => r.pe_oi || 0);
+        renderCandleChart(candleData.candles || []);
+        renderOILinesChart(oiData);
+        renderPCRChart(oiData);
 
-    charts.oi = new Chart(ctx, {
+    } catch (e) { console.error('Smart OI error:', e); }
+}
+
+function renderCandleChart(candles) {
+    const ctx = document.getElementById('chart-candle');
+    if (charts.candle) charts.candle.destroy();
+
+    if (!candles.length) {
+        charts.candle = new Chart(ctx, {
+            type: 'line',
+            data: { labels: ['No data'], datasets: [{ data: [0] }] },
+        });
+        return;
+    }
+
+    const labels = candles.map(c => c.timestamp?.split('T')[1]?.slice(0,5) || '');
+    const closes = candles.map(c => c.close);
+    const opens = candles.map(c => c.open);
+    const colors = candles.map(c => c.close >= c.open ? COLORS.green : COLORS.red);
+
+    charts.candle = new Chart(ctx, {
         type: 'bar',
         data: {
             labels,
             datasets: [
-                { label: 'Call OI', data: ceOI, backgroundColor: 'rgba(255, 69, 58, 0.6)', hoverBackgroundColor: 'rgba(255, 69, 58, 0.9)', borderRadius: 3 },
-                { label: 'Put OI', data: peOI, backgroundColor: 'rgba(48, 209, 88, 0.6)', hoverBackgroundColor: 'rgba(48, 209, 88, 0.9)', borderRadius: 3 },
-            ]
+                {
+                    label: 'NIFTY',
+                    data: candles.map(c => ({ o: c.open, h: c.high, l: c.low, c: c.close })),
+                    type: 'line',
+                    borderColor: COLORS.blue,
+                    backgroundColor: 'rgba(66,165,245,0.1)',
+                    data: closes,
+                    pointRadius: 0,
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3,
+                },
+            ],
         },
         options: {
-            responsive: true, maintainAspectRatio: false,
+            responsive: true,
+            maintainAspectRatio: false,
             interaction: { mode: 'index', intersect: false },
-            plugins: {
-                legend: { labels: { color: 'rgba(245,245,247,0.6)', font: { family: 'Inter', size: 11 } } },
-                tooltip: {
-                    enabled: true,
-                    backgroundColor: 'rgba(28, 28, 30, 0.95)',
-                    titleColor: '#f5f5f7',
-                    bodyColor: '#f5f5f7',
-                    borderColor: 'rgba(255,255,255,0.1)',
-                    borderWidth: 1,
-                    padding: 12,
-                    cornerRadius: 8,
-                    titleFont: { family: 'Inter', size: 13, weight: '600' },
-                    bodyFont: { family: 'Inter', size: 12 },
-                    displayColors: true,
-                    callbacks: {
-                        title: (items) => `Strike: ${items[0].label}`,
-                        label: (item) => `${item.dataset.label}: ${parseInt(item.raw).toLocaleString('en-IN')}`,
-                    }
-                }
-            },
-            scales: {
-                x: { ticks: { color: 'rgba(245,245,247,0.35)', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } },
-                y: { ticks: { color: 'rgba(245,245,247,0.35)', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } },
-            }
-        }
-    });
-}
-
-// ═══════════════════════════════════════════════════════════
-//  SIGNALS
-// ═══════════════════════════════════════════════════════════
-
-async function loadSignals() {
-    const data = await api('signals');
-    if (!data || !data.signals) return;
-
-    const tbody = document.getElementById('signals-body');
-    if (data.signals.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No signals yet</td></tr>';
-        return;
-    }
-
-    tbody.innerHTML = data.signals.map(s => `
-        <tr>
-            <td>${new Date(s.timestamp).toLocaleTimeString()}</td>
-            <td>${s.symbol}</td>
-            <td><span class="badge ${badgeClass(s.direction)}">${s.direction}</span></td>
-            <td>${formatNum(s.score, 4)}</td>
-            <td>${formatNum(s.confidence)}%</td>
-            <td><span class="badge ${badgeClass(s.regime)}">${s.regime}</span></td>
-            <td>${s.suggested_strategy || '--'}</td>
-            <td>${s.is_actionable ? '<span class="badge bullish">YES</span>' : '<span class="badge neutral">NO</span>'}</td>
-        </tr>
-    `).join('');
-}
-
-// ═══════════════════════════════════════════════════════════
-//  GREEKS
-// ═══════════════════════════════════════════════════════════
-
-async function loadGreeks() {
-    const data = await api('greeks');
-    if (!data) return;
-
-    const g = data.portfolio_greeks || {};
-    document.getElementById('g-delta').textContent = formatNum(g.delta, 4);
-    document.getElementById('g-gamma').textContent = formatNum(g.gamma, 6);
-    document.getElementById('g-theta').textContent = formatNum(g.theta);
-    document.getElementById('g-vega').textContent = formatNum(g.vega);
-
-    // Radar chart
-    const ctx = document.getElementById('greeks-chart');
-    if (charts.greeks) charts.greeks.destroy();
-
-    charts.greeks = new Chart(ctx, {
-        type: 'radar',
-        data: {
-            labels: ['Delta', 'Gamma', 'Theta', 'Vega'],
-            datasets: [{
-                label: 'Portfolio Greeks',
-                data: [
-                    Math.abs(g.delta || 0) * 100,
-                    Math.abs(g.gamma || 0) * 10000,
-                    Math.abs(g.theta || 0),
-                    Math.abs(g.vega || 0),
-                ],
-                backgroundColor: 'rgba(10, 132, 255, 0.15)',
-                borderColor: 'rgba(10, 132, 255, 0.8)',
-                borderWidth: 2,
-                pointBackgroundColor: 'rgba(10, 132, 255, 1)',
-            }]
-        },
-        options: {
-            responsive: true, maintainAspectRatio: false,
-            interaction: { mode: 'nearest', intersect: true },
-            scales: {
-                r: {
-                    grid: { color: 'rgba(255,255,255,0.06)' },
-                    angleLines: { color: 'rgba(255,255,255,0.06)' },
-                    pointLabels: { color: 'rgba(245,245,247,0.6)', font: { family: 'Inter', size: 12 } },
-                    ticks: { display: false },
-                }
-            },
             plugins: {
                 legend: { display: false },
                 tooltip: {
-                    enabled: true,
-                    backgroundColor: 'rgba(28, 28, 30, 0.95)',
-                    titleColor: '#f5f5f7',
-                    bodyColor: '#f5f5f7',
-                    borderColor: 'rgba(10, 132, 255, 0.3)',
+                    backgroundColor: 'rgba(20,22,32,0.95)',
+                    borderColor: 'rgba(255,255,255,0.1)',
                     borderWidth: 1,
-                    padding: 12,
-                    cornerRadius: 8,
-                    titleFont: { family: 'Inter', size: 13, weight: '600' },
-                    bodyFont: { family: 'Inter', size: 12 },
+                    titleFont: { weight: '600' },
                     callbacks: {
-                        title: (items) => items[0].label,
-                        label: (item) => `Value: ${item.raw.toFixed(4)}`,
-                    }
-                }
-            }
-        }
+                        label: ctx => `NIFTY: ${ctx.raw?.toFixed(2)}`,
+                    },
+                },
+            },
+            scales: {
+                x: { grid: { display: false } },
+                y: {
+                    position: 'right',
+                    grid: { color: 'rgba(255,255,255,0.03)' },
+                    ticks: { callback: v => v.toFixed(0) },
+                },
+            },
+        },
     });
 }
 
-// ═══════════════════════════════════════════════════════════
-//  SENTIMENT
-// ═══════════════════════════════════════════════════════════
+function renderOILinesChart(data) {
+    const ctx = document.getElementById('chart-oi-lines');
+    if (charts.oiLines) charts.oiLines.destroy();
 
-async function loadSentiment() {
-    const data = await api('sentiment');
-    if (!data) return;
-
-    const score = data.aggregate_score || 0;
-    document.getElementById('sent-score').textContent = formatNum(score, 4);
-    document.getElementById('sent-score').className = `stat-value ${score > 0.1 ? 'positive' : score < -0.1 ? 'negative' : 'neutral'}`;
-    document.getElementById('sent-label').textContent = data.label || 'NEUTRAL';
-    document.getElementById('sent-confidence').textContent = `${data.confidence || 0}%`;
-    document.getElementById('sent-sources').textContent = data.source_count || 0;
-
-    const mom = data.momentum || {};
-    document.getElementById('sent-momentum').textContent = mom.momentum || 'STABLE';
-
-    // Gauge (0-100, center=50)
-    const gaugeVal = Math.round((score + 1) / 2 * 100);
-    const gauge = document.getElementById('sent-gauge');
-    if (gauge) {
-        gauge.style.width = `${gaugeVal}%`;
-        gauge.className = `gauge-fill ${gaugeVal > 55 ? 'green' : gaugeVal < 45 ? 'red' : 'blue'}`;
-    }
-
-    // Feed
-    const feed = document.getElementById('sent-feed');
-    const items = [...(data.rss || []), ...(data.reddit || [])].slice(0, 20);
-    if (items.length > 0) {
-        feed.innerHTML = items.map(item => {
-            const c = item.compound || 0;
-            const color = c > 0.1 ? 'var(--green)' : c < -0.1 ? 'var(--red)' : 'var(--text-secondary)';
-            return `<div style="padding:12px 0;border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center;">
-                <div style="flex:1;margin-right:16px;">
-                    <div style="font-size:13px;color:var(--text-primary);margin-bottom:4px;">${item.title || ''}</div>
-                    <div style="font-size:11px;color:var(--text-tertiary);">${item.source} ${item.subreddit ? '/ r/' + item.subreddit : ''}</div>
-                </div>
-                <span style="font-size:13px;font-weight:600;color:${color};font-variant-numeric:tabular-nums;white-space:nowrap;">${formatNum(c, 3)}</span>
-            </div>`;
-        }).join('');
-    } else {
-        feed.innerHTML = '<div class="empty-state">No sentiment data available</div>';
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
-//  TRADES
-// ═══════════════════════════════════════════════════════════
-
-async function loadTrades() {
-    const data = await api('trades');
-    if (!data || !data.trades) return;
-
-    const tbody = document.getElementById('trades-body');
-    if (data.trades.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="10" class="empty-state">No trades yet</td></tr>';
-        return;
-    }
-
-    tbody.innerHTML = data.trades.reverse().map(t => `
-        <tr>
-            <td>${t.trade_id}</td>
-            <td>${t.symbol}</td>
-            <td>${t.option_type}</td>
-            <td>${t.strike}</td>
-            <td><span class="badge ${t.side === 'BUY' ? 'bullish' : 'bearish'}">${t.side}</span></td>
-            <td>${formatCurrency(t.entry_price)}</td>
-            <td>${formatCurrency(t.exit_price)}</td>
-            <td style="color:var(--${t.net_pnl >= 0 ? 'green' : 'red'})">${formatCurrency(t.net_pnl)}</td>
-            <td>${t.strategy}</td>
-            <td>${t.exit_reason}</td>
-        </tr>
-    `).join('');
-}
-
-// ═══════════════════════════════════════════════════════════
-//  BACKTEST
-// ═══════════════════════════════════════════════════════════
-
-async function runBacktest() {
-    const btn = document.getElementById('run-backtest-btn');
-    btn.disabled = true;
-    btn.innerHTML = '<div class="spinner"></div> Running...';
-
-    const data = await fetch('/api/backtest', { method: 'POST' }).then(r => r.json()).catch(() => null);
-
-    btn.disabled = false;
-    btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run Backtest';
-
-    if (!data || data.error) {
-        alert(data?.error || 'Backtest failed');
-        return;
-    }
-
-    document.getElementById('backtest-results').style.display = 'block';
-
-    // Stats
-    document.getElementById('bt-stats').innerHTML = [
-        { label: 'Total P&L', value: formatCurrency(data.total_pnl), cls: pnlClass(data.total_pnl) },
-        { label: 'Win Rate', value: `${data.win_rate}%`, cls: 'neutral' },
-        { label: 'Total Trades', value: data.total_trades, cls: 'neutral' },
-        { label: 'Profit Factor', value: formatNum(data.profit_factor), cls: 'neutral' },
-        { label: 'Max Drawdown', value: `${formatNum(data.max_drawdown_pct)}%`, cls: 'negative' },
-        { label: 'Sharpe Ratio', value: formatNum(data.sharpe_ratio), cls: 'neutral' },
-    ].map(s => `<div class="stat-card"><div class="stat-label">${s.label}</div><div class="stat-value ${s.cls}">${s.value}</div></div>`).join('');
-
-    // Equity curve chart
-    if (data.equity_curve && data.equity_curve.length > 0) {
-        const ctx = document.getElementById('bt-equity-chart');
-        if (charts.btEquity) charts.btEquity.destroy();
-
-        charts.btEquity = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: data.equity_curve.map((_, i) => i),
-                datasets: [{
-                    label: 'Equity',
-                    data: data.equity_curve.map(e => e.equity),
-                    borderColor: 'rgba(10, 132, 255, 0.8)',
-                    backgroundColor: 'rgba(10, 132, 255, 0.1)',
-                    fill: true, borderWidth: 2, pointRadius: 0,
-                    pointHoverRadius: 6, pointHoverBackgroundColor: '#0a84ff',
-                    pointHoverBorderColor: '#fff', pointHoverBorderWidth: 2,
+    charts.oiLines = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: data.timestamps || [],
+            datasets: [
+                {
+                    label: 'Put OI',
+                    data: data.put_oi || [],
+                    borderColor: COLORS.pink,
+                    borderWidth: 2,
+                    pointRadius: 0,
                     tension: 0.3,
-                }]
-            },
-            options: {
-                responsive: true, maintainAspectRatio: false,
-                interaction: { mode: 'index', intersect: false },
-                plugins: {
-                    legend: { display: false },
-                    tooltip: {
-                        enabled: true,
-                        backgroundColor: 'rgba(28, 28, 30, 0.95)',
-                        titleColor: '#f5f5f7',
-                        bodyColor: '#f5f5f7',
-                        borderColor: 'rgba(10, 132, 255, 0.3)',
-                        borderWidth: 1,
-                        padding: 12,
-                        cornerRadius: 8,
-                        titleFont: { family: 'Inter', size: 13, weight: '600' },
-                        bodyFont: { family: 'Inter', size: 12 },
-                        displayColors: false,
-                        callbacks: {
-                            title: () => 'Portfolio Value',
-                            label: (item) => `₹${parseFloat(item.raw).toLocaleString('en-IN', {minimumFractionDigits: 2})}`,
-                        }
-                    }
                 },
-                scales: {
-                    x: { display: false },
-                    y: {
-                        ticks: {
-                            color: 'rgba(245,245,247,0.35)', font: { size: 10 },
-                            callback: (v) => '₹' + (v/1000).toFixed(0) + 'K',
-                        },
-                        grid: { color: 'rgba(255,255,255,0.04)' },
+                {
+                    label: 'Call OI',
+                    data: data.call_oi || [],
+                    borderColor: COLORS.green,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.3,
+                },
+                {
+                    label: 'PE-CE',
+                    data: data.pe_ce || [],
+                    borderColor: COLORS.purple,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    borderDash: [5, 3],
+                    tension: 0.3,
+                    yAxisID: 'y1',
+                },
+            ],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                tooltip: {
+                    backgroundColor: 'rgba(20,22,32,0.95)',
+                    borderColor: 'rgba(255,255,255,0.1)',
+                    borderWidth: 1,
+                    callbacks: {
+                        label: ctx => `${ctx.dataset.label}: ${fmtLakh(ctx.raw)}`,
                     },
-                }
-            }
-        });
-    }
-
-    // Trades table
-    const tbody = document.getElementById('bt-trades-body');
-    tbody.innerHTML = (data.trades || []).map(t => `
-        <tr>
-            <td>${t.id}</td>
-            <td><span class="badge neutral">${t.strategy}</span></td>
-            <td>${formatNum(t.entry_underlying)}</td>
-            <td>${formatNum(t.exit_underlying)}</td>
-            <td style="color:var(--${t.net_pnl >= 0 ? 'green' : 'red'})">${formatCurrency(t.net_pnl)}</td>
-            <td>${t.exit_reason}</td>
-        </tr>
-    `).join('');
+                },
+            },
+            scales: {
+                x: { grid: { display: false }, ticks: { maxTicksLimit: 10 } },
+                y: {
+                    position: 'left',
+                    grid: { color: 'rgba(255,255,255,0.03)' },
+                    ticks: { callback: v => fmtLakh(v) },
+                },
+                y1: {
+                    position: 'right',
+                    grid: { display: false },
+                    ticks: { callback: v => fmtLakh(v) },
+                },
+            },
+        },
+    });
 }
 
-// ═══════════════════════════════════════════════════════════
-//  AUTO REFRESH
-// ═══════════════════════════════════════════════════════════
+function renderPCRChart(data) {
+    const ctx = document.getElementById('chart-pcr');
+    if (charts.pcr) charts.pcr.destroy();
 
-function startAutoRefresh() {
-    setInterval(updateClock, 1000);
+    charts.pcr = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: data.timestamps || [],
+            datasets: [{
+                label: 'PCR',
+                data: data.pcr || [],
+                borderColor: COLORS.cyan,
+                borderWidth: 2,
+                pointRadius: 0,
+                fill: true,
+                backgroundColor: 'rgba(38,198,218,0.08)',
+                tension: 0.4,
+            }],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                tooltip: {
+                    backgroundColor: 'rgba(20,22,32,0.95)',
+                    borderColor: 'rgba(255,255,255,0.1)',
+                    borderWidth: 1,
+                },
+            },
+            scales: {
+                x: { grid: { display: false }, ticks: { maxTicksLimit: 10 } },
+                y: {
+                    position: 'right',
+                    grid: { color: 'rgba(255,255,255,0.03)' },
+                },
+            },
+        },
+    });
+}
 
-    // Refresh current section every 5 seconds
-    setInterval(() => {
-        loadSectionData(currentSection);
-    }, 5000);
-
-    // Market status every 30 seconds
-    setInterval(async () => {
-        const status = await api('market-status');
-        if (status) {
-            const badge = document.getElementById('market-badge');
-            const text = document.getElementById('market-status-text');
-            if (status.is_open) {
-                badge.className = 'market-badge open';
-                text.textContent = 'LIVE';
-            } else {
-                badge.className = 'market-badge closed';
-                text.textContent = 'CLOSED';
-            }
+// ─── PRICE vs OI ────────────────────────────────────────
+async function loadPriceVsOI() {
+    // Load strikes
+    try {
+        const sRes = await fetch('/api/strikes');
+        const sData = await sRes.json();
+        if (sData.strikes?.length) {
+            renderStrikeList(sData.strikes, sData.atm);
+            if (!selectedStrike) selectedStrike = sData.atm;
         }
-    }, 30000);
+    } catch (e) { console.error(e); }
+
+    // Load price vs OI
+    if (selectedStrike) {
+        try {
+            const res = await fetch(`/api/price-vs-oi?strike=${selectedStrike}`);
+            const data = await res.json();
+            renderCallPriceOI(data);
+            renderPutPriceOI(data);
+            renderStraddleChart(data);
+        } catch (e) { console.error(e); }
+    }
 }
 
-// ─── Init ───────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
-    updateClock();
-    loadDashboard();
-    startAutoRefresh();
-});
+function renderStrikeList(strikes, atm) {
+    const container = document.getElementById('strike-list');
+    // Show only strikes near ATM
+    const nearStrikes = strikes.filter(s => Math.abs(s - atm) <= 500);
+
+    container.innerHTML = nearStrikes.map(s => {
+        const isActive = s === selectedStrike || (selectedStrike === 0 && s === atm);
+        return `<div class="strike-item ${isActive ? 'active' : ''}"
+                     onclick="selectStrike(${s})">${s}${s === atm ? ' ✓' : ''}</div>`;
+    }).join('');
+}
+
+window.selectStrike = function(strike) {
+    selectedStrike = strike;
+    document.querySelectorAll('.strike-item').forEach(el => {
+        el.classList.toggle('active', parseFloat(el.textContent) === strike);
+    });
+    loadPriceVsOI();
+};
+
+function renderCallPriceOI(data) {
+    const ctx = document.getElementById('chart-call-price-oi');
+    if (charts.callPriceOI) charts.callPriceOI.destroy();
+
+    const labels = (data.call || []).map(d => d.timestamp?.split('T')[1]?.slice(0,5) || '');
+
+    charts.callPriceOI = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: `${data.strike} CE OI`,
+                    data: (data.call || []).map(d => d.oi),
+                    borderColor: COLORS.green,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    yAxisID: 'y',
+                    fill: true,
+                    backgroundColor: 'rgba(38,166,154,0.08)',
+                },
+                {
+                    label: `${data.strike} CE Price`,
+                    data: (data.call || []).map(d => d.price),
+                    borderColor: COLORS.orange,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    yAxisID: 'y1',
+                },
+            ],
+        },
+        options: dualAxisOptions('OI', 'Price'),
+    });
+}
+
+function renderPutPriceOI(data) {
+    const ctx = document.getElementById('chart-put-price-oi');
+    if (charts.putPriceOI) charts.putPriceOI.destroy();
+
+    const labels = (data.put || []).map(d => d.timestamp?.split('T')[1]?.slice(0,5) || '');
+
+    charts.putPriceOI = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: `${data.strike} PE OI`,
+                    data: (data.put || []).map(d => d.oi),
+                    borderColor: COLORS.red,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    yAxisID: 'y',
+                    fill: true,
+                    backgroundColor: 'rgba(239,83,80,0.08)',
+                },
+                {
+                    label: `${data.strike} PE Price`,
+                    data: (data.put || []).map(d => d.price),
+                    borderColor: COLORS.orange,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    yAxisID: 'y1',
+                },
+            ],
+        },
+        options: dualAxisOptions('OI', 'Price'),
+    });
+}
+
+function renderStraddleChart(data) {
+    const ctx = document.getElementById('chart-straddle');
+    if (charts.straddle) charts.straddle.destroy();
+
+    const labels = (data.straddle || []).map(d => d.timestamp?.split('T')[1]?.slice(0,5) || '');
+
+    charts.straddle = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [{
+                label: 'Straddle Price',
+                data: (data.straddle || []).map(d => d.price),
+                borderColor: COLORS.blue,
+                borderWidth: 2,
+                pointRadius: 0,
+                tension: 0.3,
+                fill: true,
+                backgroundColor: 'rgba(66,165,245,0.08)',
+            }],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                tooltip: {
+                    backgroundColor: 'rgba(20,22,32,0.95)',
+                    borderColor: 'rgba(255,255,255,0.1)',
+                    borderWidth: 1,
+                },
+            },
+            scales: {
+                x: { grid: { display: false }, ticks: { maxTicksLimit: 10 } },
+                y: { position: 'left', grid: { color: 'rgba(255,255,255,0.03)' } },
+            },
+        },
+    });
+}
+
+function dualAxisOptions(leftLabel, rightLabel) {
+    return {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+            tooltip: {
+                backgroundColor: 'rgba(20,22,32,0.95)',
+                borderColor: 'rgba(255,255,255,0.1)',
+                borderWidth: 1,
+                callbacks: {
+                    label: ctx => {
+                        const val = ctx.raw;
+                        if (ctx.datasetIndex === 0) return `OI: ${fmtLakh(val)}`;
+                        return `Price: ₹${val?.toFixed(2)}`;
+                    },
+                },
+            },
+        },
+        scales: {
+            x: { grid: { display: false }, ticks: { maxTicksLimit: 10 } },
+            y: {
+                position: 'left',
+                grid: { color: 'rgba(255,255,255,0.03)' },
+                ticks: { callback: v => fmtLakh(v) },
+                title: { display: true, text: leftLabel, color: 'rgba(255,255,255,0.3)' },
+            },
+            y1: {
+                position: 'right',
+                grid: { display: false },
+                title: { display: true, text: rightLabel, color: 'rgba(255,255,255,0.3)' },
+            },
+        },
+    };
+}
+
+// ─── UTILS ──────────────────────────────────────────────
+function fmtLakh(n) {
+    if (n === null || n === undefined) return '--';
+    const abs = Math.abs(n);
+    if (abs >= 10000000) return (n / 10000000).toFixed(1) + ' Cr';
+    if (abs >= 100000) return (n / 100000).toFixed(1) + ' L';
+    if (abs >= 1000) return (n / 1000).toFixed(1) + ' K';
+    return n.toString();
+}
