@@ -117,6 +117,8 @@ class MarketDataService:
         self._smart_api = None  # Store SmartAPI session for REST calls
         self._instrument_df = None  # Instrument master for option token lookup
         self._data_source_log = "NONE"  # Track where data actually came from
+        self._day_open_oi = {}  # Track first-seen OI per strike for change calculation
+        self._day_open_date = None  # Reset tracking on new day
 
         # Rate limit tracking
         self._yf_last_call: float = 0
@@ -371,8 +373,19 @@ class MarketDataService:
                     strikes_data[strike][f"{prefix}_ltp"] = float(item.get("ltp", 0))
                     strikes_data[strike][f"{prefix}_oi"] = int(item.get("opnInterest", 0))
                     strikes_data[strike][f"{prefix}_volume"] = int(item.get("tradeVolume", 0))
-                    # OI change not directly available — compute from previous snapshot
-                    strikes_data[strike][f"{prefix}_chg_oi"] = int(item.get("opnInterest", 0)) - int(item.get("lastDayOI", 0)) if item.get("lastDayOI") else 0
+
+                    # OI change: track from day-open (first snapshot of the day)
+                    current_oi = int(item.get("opnInterest", 0))
+                    today = datetime.now(IST).date()
+                    if self._day_open_date != today:
+                        self._day_open_oi = {}
+                        self._day_open_date = today
+
+                    oi_key = f"{strike}_{prefix}"
+                    if oi_key not in self._day_open_oi:
+                        self._day_open_oi[oi_key] = current_oi
+
+                    strikes_data[strike][f"{prefix}_chg_oi"] = current_oi - self._day_open_oi[oi_key]
                     strikes_data[strike][f"{prefix}_iv"] = 0  # IV not in this endpoint
 
             except Exception as e:
