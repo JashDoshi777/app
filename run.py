@@ -283,7 +283,8 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
              future_ltp, future_oi_change, atm_strike, atm_ce_ltp, atm_pe_ltp, straddle_price)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            timestamp, "NIFTY", underlying, underlying, underlying, underlying, underlying, 0,
+            timestamp, "NIFTY", underlying, underlying, underlying, underlying, underlying,
+            total_ce_vol + total_pe_vol,
             total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol,
             pe_ce_diff, pe_ce_diff_change, pcr,
             future_ltp, 0, atm, atm_ce_ltp, atm_pe_ltp, straddle
@@ -291,6 +292,7 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
 
         # Insert per-strike snapshots
         for _, row in chain_df.iterrows():
+            strike_pe_ce_diff = int(row["pe_oi"]) - int(row["ce_oi"])
             cur.execute("""
                 INSERT INTO oi_snapshots
                 (timestamp, symbol, strike, underlying_price, expiry,
@@ -308,7 +310,8 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
                 float(row["pe_ltp"]), float(row.get("pe_iv", 0)),
                 float(row.get("pe_delta", 0)), float(row.get("pe_gamma", 0)),
                 float(row.get("pe_theta", 0)), float(row.get("pe_vega", 0)),
-                int(row["pe_oi"]) - int(row["ce_oi"]), 0, pcr, future_ltp, 0
+                strike_pe_ce_diff, int(row["pe_chg_oi"]) - int(row["ce_chg_oi"]),
+                pcr, future_ltp, 0
             ))
 
         conn.commit()

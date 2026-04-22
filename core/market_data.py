@@ -398,29 +398,69 @@ class MarketDataService:
         if not strikes_data:
             return pd.DataFrame()
 
-        # Build DataFrame
+        # Compute days to expiry for IV/Greeks calculation
+        dte_years = 7 / 365  # Default: 7 days
+        try:
+            # Parse expiry from the first strike's data
+            sample_expiry = list(strikes_data.values())[0].get("expiry", "")
+            if sample_expiry:
+                from datetime import datetime as _dt
+                exp_dt = _dt.strptime(sample_expiry, "%d%b%Y")
+                now_dt = datetime.now(IST).replace(tzinfo=None)
+                days_left = max((exp_dt - now_dt).days, 1)
+                dte_years = days_left / 365
+        except Exception:
+            pass  # Use default 7 days
+
+        # Build DataFrame with IV and Greeks
+        from core.black_scholes import compute_iv_and_greeks
+
+        RISK_FREE_RATE = 0.07  # India 10Y government bond ~7%
+
         rows = []
         for strike, data in sorted(strikes_data.items()):
+            ce_ltp = data.get("ce_ltp", 0)
+            pe_ltp = data.get("pe_ltp", 0)
+            strike_val = data["strike"]
+
+            # Compute IV + Greeks for CE
+            if ce_ltp > 0 and underlying > 0:
+                ce_greeks = compute_iv_and_greeks(underlying, strike_val, dte_years, RISK_FREE_RATE, ce_ltp, "CE")
+            else:
+                ce_greeks = {"iv": 0, "delta": 0, "gamma": 0, "theta": 0, "vega": 0}
+
+            # Compute IV + Greeks for PE
+            if pe_ltp > 0 and underlying > 0:
+                pe_greeks = compute_iv_and_greeks(underlying, strike_val, dte_years, RISK_FREE_RATE, pe_ltp, "PE")
+            else:
+                pe_greeks = {"iv": 0, "delta": 0, "gamma": 0, "theta": 0, "vega": 0}
+
             rows.append({
-                "strike": data["strike"],
+                "strike": strike_val,
                 "expiry": data.get("expiry", ""),
                 "ce_oi": data.get("ce_oi", 0),
                 "ce_chg_oi": data.get("ce_chg_oi", 0),
                 "ce_volume": data.get("ce_volume", 0),
-                "ce_ltp": data.get("ce_ltp", 0),
-                "ce_iv": data.get("ce_iv", 0),
-                "ce_delta": 0, "ce_gamma": 0, "ce_theta": 0, "ce_vega": 0,
+                "ce_ltp": ce_ltp,
+                "ce_iv": ce_greeks["iv"],
+                "ce_delta": ce_greeks["delta"],
+                "ce_gamma": ce_greeks["gamma"],
+                "ce_theta": ce_greeks["theta"],
+                "ce_vega": ce_greeks["vega"],
                 "pe_oi": data.get("pe_oi", 0),
                 "pe_chg_oi": data.get("pe_chg_oi", 0),
                 "pe_volume": data.get("pe_volume", 0),
-                "pe_ltp": data.get("pe_ltp", 0),
-                "pe_iv": data.get("pe_iv", 0),
-                "pe_delta": 0, "pe_gamma": 0, "pe_theta": 0, "pe_vega": 0,
+                "pe_ltp": pe_ltp,
+                "pe_iv": pe_greeks["iv"],
+                "pe_delta": pe_greeks["delta"],
+                "pe_gamma": pe_greeks["gamma"],
+                "pe_theta": pe_greeks["theta"],
+                "pe_vega": pe_greeks["vega"],
             })
 
         df = pd.DataFrame(rows)
         self._data_source_log = "ANGEL_ONE_API"
-        logger.info("[LIVE] Option chain from Angel One: %d strikes, OI data included", len(df))
+        logger.info("[LIVE] Option chain from Angel One: %d strikes, IV+Greeks computed", len(df))
         return df
 
     # ═══════════════════════════════════════════════════════

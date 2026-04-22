@@ -1,8 +1,11 @@
 /* ═══════════════════════════════════════════════════════════
-   NIFTY OI Tracker — Interactive Dashboard JS
+   NIFTY OI Tracker — Interactive Dashboard JS v4
+   - TradingView Lightweight Charts for candlestick
+   - Chart.js for OI/PCR/Price charts
+   - All filters working, all tooltips interactive
    ═══════════════════════════════════════════════════════════ */
 
-// ─── Chart Defaults ─────────────────────────────────────
+// ─── Chart.js Defaults ──────────────────────────────────
 Chart.defaults.color = 'rgba(232,234,237,0.5)';
 Chart.defaults.borderColor = 'rgba(255,255,255,0.06)';
 Chart.defaults.font.family = "'Inter', sans-serif";
@@ -19,8 +22,12 @@ const COLORS = {
 
 // ─── State ──────────────────────────────────────────────
 let currentTab = 'oi-table';
+let currentTf = 1;
+let currentMode = 'live';
 let selectedStrike = 0;
 let charts = {};
+let tvChart = null;       // TradingView Lightweight Chart instance
+let tvSeries = null;      // Candlestick series
 let refreshInterval = null;
 
 // ─── Init ───────────────────────────────────────────────
@@ -28,6 +35,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initTabs();
     initTimeframeButtons();
     initModeButtons();
+    initFilters();
     startClock();
     checkMarketStatus();
     loadAllData();
@@ -54,6 +62,7 @@ function initTimeframeButtons() {
         btn.addEventListener('click', () => {
             document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
+            currentTf = parseInt(btn.dataset.tf) || 1;
             loadAllData();
         });
     });
@@ -64,9 +73,17 @@ function initModeButtons() {
         btn.addEventListener('click', () => {
             document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
+            currentMode = btn.dataset.mode;
             loadAllData();
         });
     });
+}
+
+function initFilters() {
+    const oiMode = document.getElementById('oi-display-mode');
+    const rangeSelect = document.getElementById('strike-range');
+    if (oiMode) oiMode.addEventListener('change', loadAllData);
+    if (rangeSelect) rangeSelect.addEventListener('change', loadAllData);
 }
 
 // ═══ CLOCK & STATUS ═════════════════════════════════════
@@ -106,19 +123,22 @@ async function checkMarketStatus() {
 
 // ═══ DATA LOADING ═══════════════════════════════════════
 async function loadAllData() {
-    if (currentTab === 'oi-table') await loadOITable();
-    if (currentTab === 'smart-oi') await loadSmartOI();
-    if (currentTab === 'price-oi') await loadPriceVsOI();
+    try {
+        if (currentTab === 'oi-table') await loadOITable();
+        if (currentTab === 'smart-oi') await loadSmartOI();
+        if (currentTab === 'price-oi') await loadPriceVsOI();
+    } catch (e) { console.error('loadAllData error:', e); }
 }
 
 // ─── OI TABLE ───────────────────────────────────────────
 async function loadOITable() {
     try {
-        const res = await fetch('/api/oi-table');
+        const rangeEl = document.getElementById('strike-range');
+        const range = rangeEl ? rangeEl.value : 10;
+        const res = await fetch(`/api/oi-table?tf=${currentTf}&range_strikes=${range}`);
         const data = await res.json();
         if (!data.rows || !data.rows.length) return;
 
-        // Update underlying price
         const raw = data.rows[0]._raw;
         if (raw) {
             document.getElementById('underlying-price').textContent = raw.underlying?.toFixed(2) || '--';
@@ -129,7 +149,7 @@ async function loadOITable() {
             const raw = r._raw || {};
             const peDiff = raw.pe_ce_diff || 0;
             const signal = raw.pcr > 1.2 ? 'up' : raw.pcr < 0.8 ? 'down' : 'side';
-            const signalText = raw.pcr > 1.2 ? '↑ LU' : raw.pcr < 0.8 ? '↓ SC' : '→ S';
+            const signalText = raw.pcr > 1.2 ? 'LU' : raw.pcr < 0.8 ? 'SC' : 'S';
 
             return `<tr>
                 <td class="col-time">${r.time}</td>
@@ -140,11 +160,14 @@ async function loadOITable() {
                 <td class="${valClass(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>
                 <td class="${valClass(raw.ce_oi_change)}">${r.ce_oi_change}</td>
                 <td class="${peDiff > 0 ? 'val-pos' : 'val-neg'}">${r.pe_ce_total}</td>
+                <td class="${valClass(r.pe_ce_change_day)}">${r.pe_ce_change_day || '0'}</td>
                 <td class="${raw.pe_ce_diff_change > 0 ? 'val-pos' : 'val-neg'}">${r.pe_ce_change}</td>
                 <td>${r.pcr?.toFixed(2)}</td>
                 <td class="val-neutral">${r.future_ltp}</td>
                 <td class="val-neutral">${r.straddle}</td>
                 <td class="val-neutral">${r.atm_strike}</td>
+                <td class="${valClass(r.ce_delta_chg)}">${r.ce_delta_chg > 0 ? '+' : ''}${r.ce_delta_chg}</td>
+                <td class="${valClass(r.pe_delta_chg)}">${r.pe_delta_chg > 0 ? '+' : ''}${r.pe_delta_chg}</td>
                 <td><span class="signal-badge signal-${signal}">${signalText}</span></td>
             </tr>`;
         }).join('');
@@ -161,86 +184,117 @@ function valClass(v) {
 async function loadSmartOI() {
     try {
         const [oiRes, candleRes] = await Promise.all([
-            fetch('/api/oi-chart'),
-            fetch('/api/candles'),
+            fetch(`/api/oi-chart?tf=${currentTf}`),
+            fetch(`/api/candles?tf=${currentTf}`),
         ]);
         const oiData = await oiRes.json();
         const candleData = await candleRes.json();
 
-        renderCandleChart(candleData.candles || []);
+        renderTVCandleChart(candleData.candles || []);
         renderOILinesChart(oiData);
         renderPCRChart(oiData);
 
     } catch (e) { console.error('Smart OI error:', e); }
 }
 
-function renderCandleChart(candles) {
-    const ctx = document.getElementById('chart-candle');
-    if (charts.candle) charts.candle.destroy();
+// ─── TRADINGVIEW CANDLESTICK CHART ──────────────────────
+function renderTVCandleChart(candles) {
+    const container = document.getElementById('tv-candle-container');
+    if (!container) return;
 
-    if (!candles.length) {
-        charts.candle = new Chart(ctx, {
+    // Create chart only once, then update data
+    if (!tvChart) {
+        container.innerHTML = '';
+        tvChart = LightweightCharts.createChart(container, {
+            width: container.clientWidth,
+            height: 320,
+            layout: {
+                background: { type: 'solid', color: '#0c0e14' },
+                textColor: 'rgba(232,234,237,0.5)',
+                fontFamily: "'Inter', sans-serif",
+                fontSize: 11,
+            },
+            grid: {
+                vertLines: { color: 'rgba(255,255,255,0.03)' },
+                horzLines: { color: 'rgba(255,255,255,0.03)' },
+            },
+            crosshair: {
+                mode: LightweightCharts.CrosshairMode.Normal,
+                vertLine: { color: 'rgba(255,255,255,0.15)', width: 1, style: 2 },
+                horzLine: { color: 'rgba(255,255,255,0.15)', width: 1, style: 2 },
+            },
+            rightPriceScale: {
+                borderColor: 'rgba(255,255,255,0.06)',
+                scaleMargins: { top: 0.1, bottom: 0.1 },
+            },
+            timeScale: {
+                borderColor: 'rgba(255,255,255,0.06)',
+                timeVisible: true,
+                secondsVisible: false,
+            },
+            handleScroll: true,
+            handleScale: true,
+        });
+
+        tvSeries = tvChart.addCandlestickSeries({
+            upColor: COLORS.green,
+            downColor: COLORS.red,
+            borderUpColor: COLORS.green,
+            borderDownColor: COLORS.red,
+            wickUpColor: COLORS.green,
+            wickDownColor: COLORS.red,
+        });
+
+        // Resize observer
+        const ro = new ResizeObserver(() => {
+            tvChart.applyOptions({ width: container.clientWidth });
+        });
+        ro.observe(container);
+    }
+
+    if (!candles.length) return;
+
+    // Convert to Lightweight Charts format: { time: unix_timestamp, open, high, low, close }
+    const tvData = candles.map(c => {
+        let time;
+        if (c.timestamp) {
+            // ISO string to unix timestamp
+            time = Math.floor(new Date(c.timestamp).getTime() / 1000);
+        } else {
+            time = Math.floor(Date.now() / 1000);
+        }
+        return {
+            time,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+        };
+    }).filter(d => d.time > 0 && !isNaN(d.open));
+
+    // Sort by time (required by Lightweight Charts)
+    tvData.sort((a, b) => a.time - b.time);
+
+    if (tvData.length > 0) {
+        tvSeries.setData(tvData);
+        tvChart.timeScale().fitContent();
+    }
+}
+
+// ─── OI LINES CHART ─────────────────────────────────────
+function renderOILinesChart(data) {
+    const ctx = document.getElementById('chart-oi-lines');
+    if (!ctx) return;
+    if (charts.oiLines) { charts.oiLines.destroy(); charts.oiLines = null; }
+
+    if (!data.timestamps || !data.timestamps.length) {
+        charts.oiLines = new Chart(ctx, {
             type: 'line',
-            data: { labels: ['No data'], datasets: [{ data: [0] }] },
+            data: { labels: ['Waiting...'], datasets: [{ data: [0], borderColor: COLORS.blue }] },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } },
         });
         return;
     }
-
-    const labels = candles.map(c => c.timestamp?.split('T')[1]?.slice(0,5) || '');
-    const closes = candles.map(c => c.close);
-    const opens = candles.map(c => c.open);
-    const colors = candles.map(c => c.close >= c.open ? COLORS.green : COLORS.red);
-
-    charts.candle = new Chart(ctx, {
-        type: 'bar',
-        data: {
-            labels,
-            datasets: [
-                {
-                    label: 'NIFTY',
-                    data: candles.map(c => ({ o: c.open, h: c.high, l: c.low, c: c.close })),
-                    type: 'line',
-                    borderColor: COLORS.blue,
-                    backgroundColor: 'rgba(66,165,245,0.1)',
-                    data: closes,
-                    pointRadius: 0,
-                    borderWidth: 2,
-                    fill: true,
-                    tension: 0.3,
-                },
-            ],
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: { mode: 'index', intersect: false },
-            plugins: {
-                legend: { display: false },
-                tooltip: {
-                    backgroundColor: 'rgba(20,22,32,0.95)',
-                    borderColor: 'rgba(255,255,255,0.1)',
-                    borderWidth: 1,
-                    titleFont: { weight: '600' },
-                    callbacks: {
-                        label: ctx => `NIFTY: ${ctx.raw?.toFixed(2)}`,
-                    },
-                },
-            },
-            scales: {
-                x: { grid: { display: false } },
-                y: {
-                    position: 'right',
-                    grid: { color: 'rgba(255,255,255,0.03)' },
-                    ticks: { callback: v => v.toFixed(0) },
-                },
-            },
-        },
-    });
-}
-
-function renderOILinesChart(data) {
-    const ctx = document.getElementById('chart-oi-lines');
-    if (charts.oiLines) charts.oiLines.destroy();
 
     charts.oiLines = new Chart(ctx, {
         type: 'line',
@@ -264,7 +318,7 @@ function renderOILinesChart(data) {
                     tension: 0.3,
                 },
                 {
-                    label: 'PE-CE',
+                    label: 'PE-CE Diff',
                     data: data.pe_ce || [],
                     borderColor: COLORS.purple,
                     borderWidth: 2,
@@ -284,6 +338,7 @@ function renderOILinesChart(data) {
                     backgroundColor: 'rgba(20,22,32,0.95)',
                     borderColor: 'rgba(255,255,255,0.1)',
                     borderWidth: 1,
+                    titleFont: { weight: '600' },
                     callbacks: {
                         label: ctx => `${ctx.dataset.label}: ${fmtLakh(ctx.raw)}`,
                     },
@@ -295,20 +350,33 @@ function renderOILinesChart(data) {
                     position: 'left',
                     grid: { color: 'rgba(255,255,255,0.03)' },
                     ticks: { callback: v => fmtLakh(v) },
+                    title: { display: true, text: 'OI', color: 'rgba(255,255,255,0.3)' },
                 },
                 y1: {
                     position: 'right',
                     grid: { display: false },
                     ticks: { callback: v => fmtLakh(v) },
+                    title: { display: true, text: 'PE-CE', color: 'rgba(255,255,255,0.3)' },
                 },
             },
         },
     });
 }
 
+// ─── PCR CHART ──────────────────────────────────────────
 function renderPCRChart(data) {
     const ctx = document.getElementById('chart-pcr');
-    if (charts.pcr) charts.pcr.destroy();
+    if (!ctx) return;
+    if (charts.pcr) { charts.pcr.destroy(); charts.pcr = null; }
+
+    if (!data.timestamps || !data.timestamps.length) {
+        charts.pcr = new Chart(ctx, {
+            type: 'line',
+            data: { labels: ['Waiting...'], datasets: [{ data: [0], borderColor: COLORS.cyan }] },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } },
+        });
+        return;
+    }
 
     charts.pcr = new Chart(ctx, {
         type: 'line',
@@ -334,6 +402,10 @@ function renderPCRChart(data) {
                     backgroundColor: 'rgba(20,22,32,0.95)',
                     borderColor: 'rgba(255,255,255,0.1)',
                     borderWidth: 1,
+                    titleFont: { weight: '600' },
+                    callbacks: {
+                        label: ctx => `PCR: ${ctx.raw?.toFixed(4)}`,
+                    },
                 },
             },
             scales: {
@@ -341,6 +413,7 @@ function renderPCRChart(data) {
                 y: {
                     position: 'right',
                     grid: { color: 'rgba(255,255,255,0.03)' },
+                    ticks: { callback: v => v.toFixed(2) },
                 },
             },
         },
@@ -349,7 +422,6 @@ function renderPCRChart(data) {
 
 // ─── PRICE vs OI ────────────────────────────────────────
 async function loadPriceVsOI() {
-    // Load strikes
     try {
         const sRes = await fetch('/api/strikes');
         const sData = await sRes.json();
@@ -359,7 +431,6 @@ async function loadPriceVsOI() {
         }
     } catch (e) { console.error(e); }
 
-    // Load price vs OI
     if (selectedStrike) {
         try {
             const res = await fetch(`/api/price-vs-oi?strike=${selectedStrike}`);
@@ -373,13 +444,13 @@ async function loadPriceVsOI() {
 
 function renderStrikeList(strikes, atm) {
     const container = document.getElementById('strike-list');
-    // Show only strikes near ATM
+    if (!container) return;
     const nearStrikes = strikes.filter(s => Math.abs(s - atm) <= 500);
 
     container.innerHTML = nearStrikes.map(s => {
         const isActive = s === selectedStrike || (selectedStrike === 0 && s === atm);
         return `<div class="strike-item ${isActive ? 'active' : ''}"
-                     onclick="selectStrike(${s})">${s}${s === atm ? ' ✓' : ''}</div>`;
+                     onclick="selectStrike(${s})">${s}${s === atm ? ' ATM' : ''}</div>`;
     }).join('');
 }
 
@@ -393,9 +464,12 @@ window.selectStrike = function(strike) {
 
 function renderCallPriceOI(data) {
     const ctx = document.getElementById('chart-call-price-oi');
-    if (charts.callPriceOI) charts.callPriceOI.destroy();
+    if (!ctx) return;
+    if (charts.callPriceOI) { charts.callPriceOI.destroy(); charts.callPriceOI = null; }
 
-    const labels = (data.call || []).map(d => d.timestamp?.split('T')[1]?.slice(0,5) || '');
+    const callData = data.call || [];
+    if (!callData.length) return;
+    const labels = callData.map(d => d.timestamp?.split('T')[1]?.slice(0,5) || '');
 
     charts.callPriceOI = new Chart(ctx, {
         type: 'line',
@@ -404,7 +478,7 @@ function renderCallPriceOI(data) {
             datasets: [
                 {
                     label: `${data.strike} CE OI`,
-                    data: (data.call || []).map(d => d.oi),
+                    data: callData.map(d => d.oi),
                     borderColor: COLORS.green,
                     borderWidth: 2,
                     pointRadius: 0,
@@ -415,7 +489,7 @@ function renderCallPriceOI(data) {
                 },
                 {
                     label: `${data.strike} CE Price`,
-                    data: (data.call || []).map(d => d.price),
+                    data: callData.map(d => d.price),
                     borderColor: COLORS.orange,
                     borderWidth: 2,
                     pointRadius: 0,
@@ -424,15 +498,18 @@ function renderCallPriceOI(data) {
                 },
             ],
         },
-        options: dualAxisOptions('OI', 'Price'),
+        options: dualAxisOptions('OI', 'Price (₹)'),
     });
 }
 
 function renderPutPriceOI(data) {
     const ctx = document.getElementById('chart-put-price-oi');
-    if (charts.putPriceOI) charts.putPriceOI.destroy();
+    if (!ctx) return;
+    if (charts.putPriceOI) { charts.putPriceOI.destroy(); charts.putPriceOI = null; }
 
-    const labels = (data.put || []).map(d => d.timestamp?.split('T')[1]?.slice(0,5) || '');
+    const putData = data.put || [];
+    if (!putData.length) return;
+    const labels = putData.map(d => d.timestamp?.split('T')[1]?.slice(0,5) || '');
 
     charts.putPriceOI = new Chart(ctx, {
         type: 'line',
@@ -441,7 +518,7 @@ function renderPutPriceOI(data) {
             datasets: [
                 {
                     label: `${data.strike} PE OI`,
-                    data: (data.put || []).map(d => d.oi),
+                    data: putData.map(d => d.oi),
                     borderColor: COLORS.red,
                     borderWidth: 2,
                     pointRadius: 0,
@@ -452,7 +529,7 @@ function renderPutPriceOI(data) {
                 },
                 {
                     label: `${data.strike} PE Price`,
-                    data: (data.put || []).map(d => d.price),
+                    data: putData.map(d => d.price),
                     borderColor: COLORS.orange,
                     borderWidth: 2,
                     pointRadius: 0,
@@ -461,15 +538,18 @@ function renderPutPriceOI(data) {
                 },
             ],
         },
-        options: dualAxisOptions('OI', 'Price'),
+        options: dualAxisOptions('OI', 'Price (₹)'),
     });
 }
 
 function renderStraddleChart(data) {
     const ctx = document.getElementById('chart-straddle');
-    if (charts.straddle) charts.straddle.destroy();
+    if (!ctx) return;
+    if (charts.straddle) { charts.straddle.destroy(); charts.straddle = null; }
 
-    const labels = (data.straddle || []).map(d => d.timestamp?.split('T')[1]?.slice(0,5) || '');
+    const straddleData = data.straddle || [];
+    if (!straddleData.length) return;
+    const labels = straddleData.map(d => d.timestamp?.split('T')[1]?.slice(0,5) || '');
 
     charts.straddle = new Chart(ctx, {
         type: 'line',
@@ -477,7 +557,7 @@ function renderStraddleChart(data) {
             labels,
             datasets: [{
                 label: 'Straddle Price',
-                data: (data.straddle || []).map(d => d.price),
+                data: straddleData.map(d => d.price),
                 borderColor: COLORS.blue,
                 borderWidth: 2,
                 pointRadius: 0,
@@ -495,11 +575,19 @@ function renderStraddleChart(data) {
                     backgroundColor: 'rgba(20,22,32,0.95)',
                     borderColor: 'rgba(255,255,255,0.1)',
                     borderWidth: 1,
+                    titleFont: { weight: '600' },
+                    callbacks: {
+                        label: ctx => `Straddle: ₹${ctx.raw?.toFixed(2)}`,
+                    },
                 },
             },
             scales: {
                 x: { grid: { display: false }, ticks: { maxTicksLimit: 10 } },
-                y: { position: 'left', grid: { color: 'rgba(255,255,255,0.03)' } },
+                y: {
+                    position: 'left',
+                    grid: { color: 'rgba(255,255,255,0.03)' },
+                    ticks: { callback: v => '₹' + v.toFixed(0) },
+                },
             },
         },
     });
@@ -515,6 +603,7 @@ function dualAxisOptions(leftLabel, rightLabel) {
                 backgroundColor: 'rgba(20,22,32,0.95)',
                 borderColor: 'rgba(255,255,255,0.1)',
                 borderWidth: 1,
+                titleFont: { weight: '600' },
                 callbacks: {
                     label: ctx => {
                         const val = ctx.raw;
@@ -535,6 +624,7 @@ function dualAxisOptions(leftLabel, rightLabel) {
             y1: {
                 position: 'right',
                 grid: { display: false },
+                ticks: { callback: v => '₹' + v.toFixed(0) },
                 title: { display: true, text: rightLabel, color: 'rgba(255,255,255,0.3)' },
             },
         },

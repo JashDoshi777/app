@@ -35,7 +35,6 @@ def _sanitize(obj):
 
 _engine_state = {
     "market_data": None,
-    "instruments": None,
     "option_chain_analyzer": None,
     "data_buffer": None,
     "db_engine": None,
@@ -85,16 +84,36 @@ async def market_status():
 
 
 @router.get("/oi-table")
-async def get_oi_table():
-    """Minute-by-minute OI table data (like StockMojo PE-CE OI Difference)."""
+async def get_oi_table(
+    tf: int = Query(1, description="Timeframe in minutes (1,3,5,15,60)"),
+    range_strikes: int = Query(10, description="Number of strikes from ATM each side"),
+):
+    """Minute-by-minute OI table data."""
     buf = _engine_state.get("data_buffer")
     if not buf:
         return {"rows": []}
 
     rows = list(buf["oi_table"])
+
+    # Timeframe aggregation: sample every N minutes
+    if tf > 1 and len(rows) > 1:
+        sampled = []
+        for i in range(0, len(rows), tf):
+            sampled.append(rows[i])
+        rows = sampled
+
     # Format for display
     formatted = []
-    for r in rows:
+    prev_ce_ltp = 0
+    prev_pe_ltp = 0
+
+    for i, r in enumerate(rows):
+        # Delta change = LTP change from previous minute
+        ce_delta_chg = round(r["atm_ce_ltp"] - prev_ce_ltp, 2) if prev_ce_ltp > 0 else 0
+        pe_delta_chg = round(r["atm_pe_ltp"] - prev_pe_ltp, 2) if prev_pe_ltp > 0 else 0
+
+        pe_ce_chg_day = r["pe_oi_change_day"] - r["ce_oi_change_day"]
+
         formatted.append({
             "time": r["timestamp"],
             "pe_oi_total": _fmt_lakh(r["total_pe_oi"]),
@@ -104,27 +123,36 @@ async def get_oi_table():
             "ce_oi_change_day": _fmt_lakh(r["ce_oi_change_day"]),
             "ce_oi_change": _fmt_lakh(r["ce_oi_change"]),
             "pe_ce_total": _fmt_lakh(r["pe_ce_diff"]),
+            "pe_ce_change_day": _fmt_lakh(pe_ce_chg_day),
             "pe_ce_change": _fmt_lakh(r["pe_ce_diff_change"]),
-            "pe_ce_pct": round(r["pe_ce_diff"] / max(abs(r["total_ce_oi"]), 1) * 100, 1),
             "pcr": r["pcr"],
             "future_ltp": round(r["future_ltp"], 2),
             "straddle": r["straddle"],
             "atm_strike": r["atm_strike"],
+            "ce_delta_chg": ce_delta_chg,
+            "pe_delta_chg": pe_delta_chg,
             # Raw values for charts
             "_raw": r,
         })
+        prev_ce_ltp = r["atm_ce_ltp"]
+        prev_pe_ltp = r["atm_pe_ltp"]
 
     return _sanitize({"rows": formatted})
 
 
 @router.get("/oi-chart")
-async def get_oi_chart():
+async def get_oi_chart(tf: int = Query(1)):
     """Time series for Put OI, Call OI, PE-CE diff, PCR charts."""
     buf = _engine_state.get("data_buffer")
     if not buf:
         return {"timestamps": [], "put_oi": [], "call_oi": [], "pe_ce": [], "pcr": []}
 
     rows = list(reversed(list(buf["oi_table"])))  # Chronological order
+
+    # Timeframe sampling
+    if tf > 1 and len(rows) > 1:
+        rows = rows[::tf]
+
     return _sanitize({
         "timestamps": [r["timestamp"] for r in rows],
         "put_oi": [r["total_pe_oi"] for r in rows],
@@ -137,12 +165,32 @@ async def get_oi_chart():
 
 
 @router.get("/candles")
-async def get_candles():
-    """NIFTY 1-min candlestick data."""
+async def get_candles(tf: int = Query(1)):
+    """NIFTY candlestick data."""
     buf = _engine_state.get("data_buffer")
     if not buf:
         return {"candles": []}
-    return _sanitize({"candles": list(buf["candles_1m"])})
+
+    candles = list(buf["candles_1m"])
+
+    # Aggregate candles for higher timeframes
+    if tf > 1 and len(candles) > 1:
+        agg = []
+        for i in range(0, len(candles), tf):
+            batch = candles[i:i+tf]
+            if not batch:
+                continue
+            agg.append({
+                "timestamp": batch[0]["timestamp"],
+                "open": batch[0]["open"],
+                "high": max(c["high"] for c in batch),
+                "low": min(c["low"] for c in batch),
+                "close": batch[-1]["close"],
+                "volume": sum(c["volume"] for c in batch),
+            })
+        candles = agg
+
+    return _sanitize({"candles": candles})
 
 
 @router.get("/price-vs-oi")
