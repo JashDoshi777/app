@@ -529,8 +529,161 @@ async def get_historical_dates():
         return {"dates": []}
 
 
+@router.get("/historical-chart")
+async def get_historical_chart(
+    date: str = Query(..., description="Date YYYY-MM-DD"),
+    tf: int = Query(1),
+    range_strikes: int = Query(10),
+):
+    """Historical chart data: OI lines, PCR, and OHLC candles from DB."""
+    import config
+    db_url = os.environ.get("DATABASE_URL", config.DATABASE_URL)
+    if not db_url:
+        return {"timestamps": [], "put_oi": [], "call_oi": [], "pe_ce": [], "pcr": [], "candles": []}
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+
+        # Check if per-strike data exists for range filtering
+        cur.execute("""
+            SELECT COUNT(*) FROM oi_snapshots
+            WHERE symbol = 'NIFTY'
+              AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+            LIMIT 1
+        """, (date,))
+        has_strikes = cur.fetchone()[0] > 0
+
+        timestamps = []
+        put_oi_vals = []
+        call_oi_vals = []
+        pe_ce_vals = []
+        pcr_vals = []
+        candle_buf = []
+
+        if has_strikes:
+            # Range-filtered: join oi_snapshots + market_snapshots
+            cur.execute("""
+                SELECT o.timestamp, m.underlying_price, m.atm_strike, m.straddle_price,
+                       o.strike, o.ce_oi, o.pe_oi
+                FROM oi_snapshots o
+                JOIN market_snapshots m ON o.timestamp = m.timestamp AND m.symbol = 'NIFTY'
+                WHERE o.symbol = 'NIFTY'
+                  AND DATE(o.timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+                ORDER BY o.timestamp ASC, o.strike ASC
+            """, (date,))
+
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            from collections import OrderedDict
+            ts_groups = OrderedDict()
+            for row in rows:
+                ts = row["timestamp"]
+                if ts not in ts_groups:
+                    ts_groups[ts] = {"underlying": float(row.get("underlying_price", 0) or 0),
+                                     "atm": float(row.get("atm_strike", 0) or 0),
+                                     "strikes": []}
+                ts_groups[ts]["strikes"].append(row)
+
+            for ts, grp in ts_groups.items():
+                atm = grp["atm"]
+                if atm <= 0:
+                    continue
+                filtered = [s for s in grp["strikes"]
+                            if abs(float(s["strike"]) - atm) <= range_strikes * 50]
+                if not filtered:
+                    continue
+                tce = sum(int(s.get("ce_oi", 0) or 0) for s in filtered)
+                tpe = sum(int(s.get("pe_oi", 0) or 0) for s in filtered)
+
+                if hasattr(ts, 'astimezone'):
+                    ts_ist = ts.astimezone(IST)
+                else:
+                    ts_ist = ts + timedelta(hours=5, minutes=30)
+
+                timestamps.append(ts_ist.strftime("%H:%M"))
+                put_oi_vals.append(tpe)
+                call_oi_vals.append(tce)
+                pe_ce_vals.append(tpe - tce)
+                pcr_vals.append(round(tpe / max(tce, 1), 4))
+                candle_buf.append({"ts": ts_ist.isoformat(), "price": grp["underlying"]})
+        else:
+            # Fallback: market_snapshots only (no range filter)
+            cur.execute("""
+                SELECT timestamp, underlying_price, total_ce_oi, total_pe_oi, pe_ce_oi_diff, pcr
+                FROM market_snapshots
+                WHERE symbol = 'NIFTY'
+                  AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+                ORDER BY timestamp ASC
+            """, (date,))
+            cols = [d[0] for d in cur.description]
+            for r in [dict(zip(cols, row)) for row in cur.fetchall()]:
+                ts = r["timestamp"]
+                if hasattr(ts, 'astimezone'):
+                    ts_ist = ts.astimezone(IST)
+                else:
+                    ts_ist = ts + timedelta(hours=5, minutes=30)
+                timestamps.append(ts_ist.strftime("%H:%M"))
+                put_oi_vals.append(int(r.get("total_pe_oi", 0) or 0))
+                call_oi_vals.append(int(r.get("total_ce_oi", 0) or 0))
+                pe_ce_vals.append(int(r.get("pe_ce_oi_diff", 0) or 0))
+                pcr_vals.append(float(r.get("pcr", 0) or 0))
+                candle_buf.append({"ts": ts_ist.isoformat(),
+                                   "price": float(r.get("underlying_price", 0) or 0)})
+
+        cur.close()
+        conn.close()
+
+        # Build OHLC candles
+        candles = _build_candles(candle_buf, tf)
+
+        # TF sampling for lines
+        if tf > 1 and len(timestamps) > 1:
+            timestamps = timestamps[::tf]
+            put_oi_vals = put_oi_vals[::tf]
+            call_oi_vals = call_oi_vals[::tf]
+            pe_ce_vals = pe_ce_vals[::tf]
+            pcr_vals = pcr_vals[::tf]
+
+        return _sanitize({
+            "timestamps": timestamps,
+            "put_oi": put_oi_vals,
+            "call_oi": call_oi_vals,
+            "pe_ce": pe_ce_vals,
+            "pcr": pcr_vals,
+            "candles": candles,
+        })
+    except Exception as e:
+        logger.error("Historical chart failed: %s", e)
+        return {"timestamps": [], "put_oi": [], "call_oi": [], "pe_ce": [], "pcr": [], "candles": []}
+
+
+def _build_candles(price_data, tf):
+    """Build OHLC candles from [{ts, price}] grouped by tf minutes."""
+    if not price_data:
+        return []
+    candles = []
+    buf = []
+    for i, p in enumerate(price_data):
+        buf.append(p)
+        if len(buf) >= tf or i == len(price_data) - 1:
+            prices = [b["price"] for b in buf]
+            candles.append({
+                "timestamp": buf[0]["ts"],
+                "open": prices[0],
+                "high": max(prices),
+                "low": min(prices),
+                "close": prices[-1],
+                "volume": 0,
+            })
+            buf = []
+    return candles
+
+
 async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
-    """Fetch historical OI table from database."""
+    """Fetch historical OI table from database with range filtering."""
     import config
     db_url = os.environ.get("DATABASE_URL", config.DATABASE_URL)
     if not db_url:
@@ -541,7 +694,7 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
 
-        # Fetch in chronological order (ASC) so we can compute changes
+        # Always need market_snapshots for ATM, straddle, future, delta change data
         cur.execute("""
             SELECT timestamp, underlying_price, total_ce_oi, total_pe_oi,
                    pe_ce_oi_diff, pe_ce_oi_diff_change, pcr, future_ltp,
@@ -552,20 +705,69 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
               AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
             ORDER BY timestamp ASC
         """, (date,))
+        ms_cols = [desc[0] for desc in cur.description]
+        ms_rows = [dict(zip(ms_cols, row)) for row in cur.fetchall()]
 
-        columns = [desc[0] for desc in cur.description]
-        db_rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+        if not ms_rows:
+            cur.close()
+            conn.close()
+            return {"rows": [], "date": date}
+
+        # Check if per-strike data is available for range filtering
+        cur.execute("""
+            SELECT COUNT(*) FROM oi_snapshots
+            WHERE symbol = 'NIFTY'
+              AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+            LIMIT 1
+        """, (date,))
+        has_strikes = cur.fetchone()[0] > 0
+
+        # Build ranged OI lookup from oi_snapshots
+        ranged_by_ts = {}
+        if has_strikes:
+            cur.execute("""
+                SELECT timestamp, strike, ce_oi, pe_oi
+                FROM oi_snapshots
+                WHERE symbol = 'NIFTY'
+                  AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+                ORDER BY timestamp ASC, strike ASC
+            """, (date,))
+            strike_cols = [desc[0] for desc in cur.description]
+            all_strike_rows = [dict(zip(strike_cols, row)) for row in cur.fetchall()]
+
+            from collections import OrderedDict
+            ts_strike_groups = OrderedDict()
+            for sr in all_strike_rows:
+                ts = sr["timestamp"]
+                if ts not in ts_strike_groups:
+                    ts_strike_groups[ts] = []
+                ts_strike_groups[ts].append(sr)
+
+            # For each timestamp, compute ranged totals
+            for ms_row in ms_rows:
+                ts = ms_row["timestamp"]
+                atm = float(ms_row.get("atm_strike", 0) or 0)
+                strikes = ts_strike_groups.get(ts, [])
+                if strikes and atm > 0:
+                    filtered = [s for s in strikes
+                                if abs(float(s["strike"]) - atm) <= range_strikes * 50]
+                    tce = sum(int(s.get("ce_oi", 0) or 0) for s in filtered)
+                    tpe = sum(int(s.get("pe_oi", 0) or 0) for s in filtered)
+                    ranged_by_ts[ts] = {"ce": tce, "pe": tpe}
+
         cur.close()
         conn.close()
 
-        if not db_rows:
-            return {"rows": [], "date": date}
-
         # Use first row as "day open" baseline
-        first_ce_oi = int(db_rows[0].get("total_ce_oi", 0) or 0)
-        first_pe_oi = int(db_rows[0].get("total_pe_oi", 0) or 0)
+        if ranged_by_ts:
+            first_ts = ms_rows[0]["timestamp"]
+            first_ranged = ranged_by_ts.get(first_ts)
+            first_ce_oi = first_ranged["ce"] if first_ranged else int(ms_rows[0].get("total_ce_oi", 0) or 0)
+            first_pe_oi = first_ranged["pe"] if first_ranged else int(ms_rows[0].get("total_pe_oi", 0) or 0)
+        else:
+            first_ce_oi = int(ms_rows[0].get("total_ce_oi", 0) or 0)
+            first_pe_oi = int(ms_rows[0].get("total_pe_oi", 0) or 0)
 
-        # Process chronologically to compute changes
         all_rows = []
         prev_ce_oi = 0
         prev_pe_oi = 0
@@ -573,7 +775,7 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         prev_ce_ltp = 0
         prev_pe_ltp = 0
 
-        for r in db_rows:
+        for r in ms_rows:
             ts = r["timestamp"]
             if hasattr(ts, 'astimezone'):
                 ts_ist = ts.astimezone(IST)
@@ -584,21 +786,25 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
             else:
                 time_str = str(ts)
 
-            total_pe = int(r.get("total_pe_oi", 0) or 0)
-            total_ce = int(r.get("total_ce_oi", 0) or 0)
+            # Use ranged OI if available, otherwise raw totals
+            ranged = ranged_by_ts.get(ts)
+            if ranged:
+                total_pe = ranged["pe"]
+                total_ce = ranged["ce"]
+            else:
+                total_pe = int(r.get("total_pe_oi", 0) or 0)
+                total_ce = int(r.get("total_ce_oi", 0) or 0)
+
             pe_ce_diff = total_pe - total_ce
-            pcr_val = float(r.get("pcr", 0) or 0)
+            pcr_val = round(total_pe / max(total_ce, 1), 4)
             straddle = float(r.get("straddle_price", 0) or 0)
             future = float(r.get("future_ltp", 0) or 0)
             atm = float(r.get("atm_strike", 0) or 0)
             atm_ce = float(r.get("atm_ce_ltp", 0) or 0)
             atm_pe = float(r.get("atm_pe_ltp", 0) or 0)
 
-            # Change (Day) = current - first row of day
             pe_chg_day = total_pe - first_pe_oi
             ce_chg_day = total_ce - first_ce_oi
-
-            # Change (minute) = current - previous row
             pe_chg_min = total_pe - prev_pe_oi if prev_pe_oi > 0 else 0
             ce_chg_min = total_ce - prev_ce_oi if prev_ce_oi > 0 else 0
             pe_ce_diff_chg = pe_ce_diff - prev_pe_ce_diff if prev_pe_ce_diff != 0 else 0
@@ -655,3 +861,4 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
     except Exception as e:
         logger.error("Historical OI table failed: %s", e)
         return {"rows": [], "error": str(e)}
+

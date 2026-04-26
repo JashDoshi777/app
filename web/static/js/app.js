@@ -196,13 +196,18 @@ async function loadSmartOI(){
         const range=rng?rng.value:10;
 
         if(currentMode==='historical'&&historicalDate){
-            // Load historical chart data from DB
-            const res=await fetch(`/api/historical?date=${historicalDate}`);
+            // Use dedicated historical-chart endpoint (range-filtered, OHLC candles)
+            const res=await fetch(`/api/historical-chart?date=${historicalDate}&tf=${currentTf}&range_strikes=${range}`);
             const data=await res.json();
-            if(data.rows&&data.rows.length){
-                renderHistoricalCharts(data.rows);
+            if(data.timestamps&&data.timestamps.length){
+                // Render OHLC candles from historical data
+                destroyTVChart();
+                renderTVCandle(data.candles||[]);
+                // Render OI lines and PCR
+                renderOILines(data);
+                renderPCR(data);
             } else {
-                showChartEmpty('chart-oi-lines','No historical data');
+                showChartEmpty('chart-oi-lines','No historical data for this date');
                 showChartEmpty('chart-pcr','No historical data');
                 destroyTVChart();
             }
@@ -219,47 +224,6 @@ async function loadSmartOI(){
         renderOILines(oiData);
         renderPCR(oiData);
     }catch(e){console.error('SmartOI:',e);}
-}
-
-function renderHistoricalCharts(rows){
-    // rows are from /api/historical — chronological (ASC)
-    const timestamps=rows.map(r=>{
-        const ts=r.timestamp;
-        if(ts&&ts.includes('T')) return ts.split('T')[1].slice(0,5);
-        return ts||'';
-    });
-    const putOI=rows.map(r=>r.total_pe_oi||0);
-    const callOI=rows.map(r=>r.total_ce_oi||0);
-    const peCE=rows.map(r=>r.pe_ce_oi_diff||0);
-    const pcrVals=rows.map(r=>r.pcr||0);
-    const underlying=rows.map(r=>r.underlying_price||0);
-
-    // Render candle from historical data (line chart since we only have close prices)
-    destroyTVChart();
-    const el=document.getElementById('tv-candle-container');
-    if(el&&underlying.length){
-        el.innerHTML='';
-        tvChart=LightweightCharts.createChart(el,{
-            width:el.clientWidth,height:320,
-            layout:{background:{type:'solid',color:'#0c0e14'},textColor:'rgba(232,234,237,0.5)',fontFamily:"'Inter',sans-serif",fontSize:11},
-            grid:{vertLines:{color:'rgba(255,255,255,0.03)'},horzLines:{color:'rgba(255,255,255,0.03)'}},
-            crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
-            rightPriceScale:{borderColor:'rgba(255,255,255,0.06)'},
-            timeScale:{borderColor:'rgba(255,255,255,0.06)',timeVisible:true,secondsVisible:false},
-        });
-        tvSeries=tvChart.addLineSeries({color:C.blue,lineWidth:2});
-        const d=rows.map(r=>{
-            const t=r.timestamp?Math.floor(new Date(r.timestamp).getTime()/1000):0;
-            return{time:t,value:r.underlying_price||0};
-        }).filter(x=>x.time>0);
-        const seen=new Map();d.forEach(x=>seen.set(x.time,x));
-        const unique=[...seen.values()].sort((a,b)=>a.time-b.time);
-        if(unique.length){tvSeries.setData(unique);tvChart.timeScale().fitContent();}
-        new ResizeObserver(()=>{if(tvChart)tvChart.applyOptions({width:el.clientWidth});}).observe(el);
-    }
-
-    renderOILines({timestamps,put_oi:putOI,call_oi:callOI,pe_ce:peCE,pcr:pcrVals});
-    renderPCR({timestamps,pcr:pcrVals});
 }
 
 function showChartEmpty(canvasId,msg){
