@@ -6,7 +6,7 @@
     <title>NIFTY OI Tracker — Live</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css?v=4">
+    <link rel="stylesheet" href="/static/css/style.css?v=5">
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
         body{font-family:'Inter',sans-serif;background:#0c0e14;color:#e8eaed;min-height:100vh;font-size:13px}
@@ -14,6 +14,21 @@
         .toolbar-left,.toolbar-center,.toolbar-right{display:flex;align-items:center;gap:12px}
         .tab-nav{display:flex;background:#141620;border-bottom:1px solid rgba(255,255,255,0.06);padding:0 16px}
         .tab-panel{display:none}.tab-panel.active{display:block}
+        /* Historical date picker */
+        .historical-controls{display:none;align-items:center;gap:8px;margin-left:8px}
+        .historical-controls.show{display:flex}
+        .historical-controls input[type="date"]{
+            background:#1a1d2e;color:#e8eaed;border:1px solid rgba(255,255,255,0.1);
+            padding:4px 8px;border-radius:4px;font-family:'Inter',sans-serif;font-size:12px;
+        }
+        .historical-controls select{
+            background:#1a1d2e;color:#e8eaed;border:1px solid rgba(255,255,255,0.1);
+            padding:4px 8px;border-radius:4px;font-family:'Inter',sans-serif;font-size:12px;
+        }
+        .historical-controls button{
+            background:#42a5f5;color:#fff;border:none;padding:4px 12px;
+            border-radius:4px;font-size:12px;cursor:pointer;font-weight:600;
+        }
     </style>
     <!-- Chart.js for OI/PCR charts -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
@@ -44,6 +59,12 @@
             <button class="mode-btn active" data-mode="live" id="btn-live">Live</button>
             <button class="mode-btn" data-mode="historical" id="btn-historical">Historical</button>
         </div>
+        <div class="historical-controls" id="historical-controls">
+            <select id="historical-date">
+                <option value="">Select Date</option>
+            </select>
+            <button id="load-historical-btn">Load</button>
+        </div>
     </div>
 
     <div class="toolbar-right">
@@ -70,9 +91,9 @@
             <span class="table-label">NIFTY Spot</span>
         </div>
         <div class="table-filters">
-            <label class="filter-label">Total OI
+            <label class="filter-label">Display
                 <select id="oi-display-mode">
-                    <option value="total">Total</option>
+                    <option value="total">Total OI</option>
                     <option value="change">OI Change (Day)</option>
                 </select>
             </label>
@@ -133,8 +154,8 @@
         <div class="chart-col-right">
             <div class="chart-card">
                 <div class="chart-title">
-                    <span class="tag pink">Put</span>
-                    <span class="tag green">Call</span>
+                    <span class="tag pink">Put OI</span>
+                    <span class="tag green">Call OI</span>
                     <span class="tag purple">PE-CE</span>
                 </div>
                 <canvas id="chart-oi-lines"></canvas>
@@ -151,12 +172,9 @@
 <section class="tab-panel" id="panel-price-oi">
     <div class="price-oi-layout">
         <div class="strike-sidebar">
-            <h3>Settings</h3>
-            <div class="strike-selector">
-                <label>Select Strike</label>
-                <div class="strike-list" id="strike-list">
-                    <div class="strike-item active">--</div>
-                </div>
+            <h3>Select Strike</h3>
+            <div class="strike-list" id="strike-list">
+                <div class="strike-item active">--</div>
             </div>
         </div>
         <div class="price-oi-charts">
@@ -178,6 +196,6 @@
     </div>
 </section>
 
-<script src="/static/js/app.js?v=4"></script>
+<script src="/static/js/app.js?v=5"></script>
 </body>
 </html>
