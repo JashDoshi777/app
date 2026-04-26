@@ -1,4 +1,4 @@
-/* NIFTY OI Tracker — Dashboard JS v5 — All filters, tooltips, historical */
+/* NIFTY OI Tracker — Dashboard JS v6 — Fixed: live switching, historical charts, tooltips */
 
 Chart.defaults.color = 'rgba(232,234,237,0.5)';
 Chart.defaults.borderColor = 'rgba(255,255,255,0.06)';
@@ -37,6 +37,8 @@ function initTimeframeButtons(){
             document.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('active'));
             btn.classList.add('active');
             currentTf=parseInt(btn.dataset.tf)||1;
+            // Destroy TV chart so it re-renders with new TF
+            destroyTVChart();
             loadAllData();
         });
     });
@@ -54,6 +56,8 @@ function initModeButtons(){
             } else {
                 hc.classList.remove('show');
                 historicalDate='';
+                // Reset all charts when switching back to live
+                destroyAllCharts();
                 loadAllData();
             }
         });
@@ -62,7 +66,10 @@ function initModeButtons(){
     if(loadBtn) loadBtn.addEventListener('click',()=>{
         const sel=document.getElementById('historical-date');
         historicalDate=sel?sel.value:'';
-        if(historicalDate) loadAllData();
+        if(historicalDate){
+            destroyAllCharts();
+            loadAllData();
+        }
     });
 }
 function initFilters(){
@@ -70,6 +77,19 @@ function initFilters(){
     const rng=document.getElementById('strike-range');
     if(oi) oi.addEventListener('change', loadAllData);
     if(rng) rng.addEventListener('change', loadAllData);
+}
+
+function destroyTVChart(){
+    if(tvChart){try{tvChart.remove();}catch(e){} tvChart=null; tvSeries=null;}
+    const el=document.getElementById('tv-candle-container');
+    if(el) el.innerHTML='';
+}
+function destroyAllCharts(){
+    destroyTVChart();
+    Object.keys(charts).forEach(k=>{
+        if(charts[k]){try{charts[k].destroy();}catch(e){}} charts[k]=null;
+    });
+    charts={};
 }
 
 async function loadHistoricalDates(){
@@ -125,10 +145,15 @@ async function loadOITable(){
         }
         const res=await fetch(url);
         const data=await res.json();
-        if(!data.rows||!data.rows.length) return;
+        if(!data.rows||!data.rows.length){
+            document.getElementById('oi-table-body').innerHTML=
+                '<tr><td colspan="17" class="empty-msg">No data available</td></tr>';
+            return;
+        }
 
         const raw0=data.rows[0]._raw;
-        if(raw0) document.getElementById('underlying-price').textContent=raw0.underlying?.toFixed(2)||'--';
+        if(raw0) document.getElementById('underlying-price').textContent=
+            raw0.underlying?.toFixed(2)||'--';
 
         const displayMode=document.getElementById('oi-display-mode');
         const showChange=displayMode&&displayMode.value==='change';
@@ -149,7 +174,7 @@ async function loadOITable(){
                 <td class="${vc(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>
                 <td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>
                 <td class="${raw.pe_ce_diff>0?'val-pos':'val-neg'}">${r.pe_ce_total}</td>
-                <td class="${vc(r.pe_ce_change_day)}">${r.pe_ce_change_day||'0'}</td>
+                <td class="${vc(raw.pe_oi_change_day-raw.ce_oi_change_day)}">${r.pe_ce_change_day||'0'}</td>
                 <td class="${raw.pe_ce_diff_change>0?'val-pos':'val-neg'}">${r.pe_ce_change}</td>
                 <td>${r.pcr?.toFixed(2)}</td>
                 <td class="val-neutral">${r.future_ltp}</td>
@@ -169,6 +194,21 @@ async function loadSmartOI(){
     try{
         const rng=document.getElementById('strike-range');
         const range=rng?rng.value:10;
+
+        if(currentMode==='historical'&&historicalDate){
+            // Load historical chart data from DB
+            const res=await fetch(`/api/historical?date=${historicalDate}`);
+            const data=await res.json();
+            if(data.rows&&data.rows.length){
+                renderHistoricalCharts(data.rows);
+            } else {
+                showChartEmpty('chart-oi-lines','No historical data');
+                showChartEmpty('chart-pcr','No historical data');
+                destroyTVChart();
+            }
+            return;
+        }
+
         const [oiRes,candleRes]=await Promise.all([
             fetch(`/api/oi-chart?tf=${currentTf}&range_strikes=${range}`),
             fetch(`/api/candles?tf=${currentTf}`),
@@ -181,13 +221,63 @@ async function loadSmartOI(){
     }catch(e){console.error('SmartOI:',e);}
 }
 
+function renderHistoricalCharts(rows){
+    // rows are from /api/historical — chronological (ASC)
+    const timestamps=rows.map(r=>{
+        const ts=r.timestamp;
+        if(ts&&ts.includes('T')) return ts.split('T')[1].slice(0,5);
+        return ts||'';
+    });
+    const putOI=rows.map(r=>r.total_pe_oi||0);
+    const callOI=rows.map(r=>r.total_ce_oi||0);
+    const peCE=rows.map(r=>r.pe_ce_oi_diff||0);
+    const pcrVals=rows.map(r=>r.pcr||0);
+    const underlying=rows.map(r=>r.underlying_price||0);
+
+    // Render candle from historical data (line chart since we only have close prices)
+    destroyTVChart();
+    const el=document.getElementById('tv-candle-container');
+    if(el&&underlying.length){
+        el.innerHTML='';
+        tvChart=LightweightCharts.createChart(el,{
+            width:el.clientWidth,height:320,
+            layout:{background:{type:'solid',color:'#0c0e14'},textColor:'rgba(232,234,237,0.5)',fontFamily:"'Inter',sans-serif",fontSize:11},
+            grid:{vertLines:{color:'rgba(255,255,255,0.03)'},horzLines:{color:'rgba(255,255,255,0.03)'}},
+            crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
+            rightPriceScale:{borderColor:'rgba(255,255,255,0.06)'},
+            timeScale:{borderColor:'rgba(255,255,255,0.06)',timeVisible:true,secondsVisible:false},
+        });
+        tvSeries=tvChart.addLineSeries({color:C.blue,lineWidth:2});
+        const d=rows.map(r=>{
+            const t=r.timestamp?Math.floor(new Date(r.timestamp).getTime()/1000):0;
+            return{time:t,value:r.underlying_price||0};
+        }).filter(x=>x.time>0);
+        const seen=new Map();d.forEach(x=>seen.set(x.time,x));
+        const unique=[...seen.values()].sort((a,b)=>a.time-b.time);
+        if(unique.length){tvSeries.setData(unique);tvChart.timeScale().fitContent();}
+        new ResizeObserver(()=>{if(tvChart)tvChart.applyOptions({width:el.clientWidth});}).observe(el);
+    }
+
+    renderOILines({timestamps,put_oi:putOI,call_oi:callOI,pe_ce:peCE,pcr:pcrVals});
+    renderPCR({timestamps,pcr:pcrVals});
+}
+
+function showChartEmpty(canvasId,msg){
+    const ctx=document.getElementById(canvasId);
+    if(!ctx) return;
+    if(charts[canvasId]){charts[canvasId].destroy();charts[canvasId]=null;}
+    charts[canvasId]=new Chart(ctx,{type:'line',
+        data:{labels:[msg],datasets:[{data:[0],borderColor:C.blue}]},
+        options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}}}});
+}
+
 function renderTVCandle(candles){
     const el=document.getElementById('tv-candle-container');
     if(!el) return;
     if(!tvChart){
         el.innerHTML='';
         tvChart=LightweightCharts.createChart(el,{
-            width:el.clientWidth, height:320,
+            width:el.clientWidth,height:320,
             layout:{background:{type:'solid',color:'#0c0e14'},textColor:'rgba(232,234,237,0.5)',fontFamily:"'Inter',sans-serif",fontSize:11},
             grid:{vertLines:{color:'rgba(255,255,255,0.03)'},horzLines:{color:'rgba(255,255,255,0.03)'}},
             crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
@@ -198,16 +288,14 @@ function renderTVCandle(candles){
             upColor:C.green,downColor:C.red,borderUpColor:C.green,borderDownColor:C.red,
             wickUpColor:C.green,wickDownColor:C.red,
         });
-        new ResizeObserver(()=>tvChart.applyOptions({width:el.clientWidth})).observe(el);
+        new ResizeObserver(()=>{if(tvChart)tvChart.applyOptions({width:el.clientWidth});}).observe(el);
     }
     if(!candles.length) return;
     const d=candles.map(c=>{
         const t=c.timestamp?Math.floor(new Date(c.timestamp).getTime()/1000):0;
         return{time:t,open:c.open,high:c.high,low:c.low,close:c.close};
     }).filter(x=>x.time>0&&!isNaN(x.open));
-    // Deduplicate by time (keep last)
-    const seen=new Map();
-    d.forEach(x=>seen.set(x.time,x));
+    const seen=new Map();d.forEach(x=>seen.set(x.time,x));
     const unique=[...seen.values()].sort((a,b)=>a.time-b.time);
     if(unique.length>0){tvSeries.setData(unique);tvChart.timeScale().fitContent();}
 }
@@ -229,8 +317,7 @@ function renderOILines(data){
             {label:'PE-CE',data:data.pe_ce,borderColor:C.purple,borderWidth:2,pointRadius:0,borderDash:[5,3],tension:0.3,yAxisID:'y1'},
         ]},
         options:{responsive:true,maintainAspectRatio:false,
-            interaction:{mode:'index',intersect:false},
-            hover:{mode:'index',intersect:false},
+            interaction:{mode:'index',intersect:false},hover:{mode:'index',intersect:false},
             plugins:{tooltip:{enabled:true,backgroundColor:'rgba(20,22,32,0.95)',borderColor:'rgba(255,255,255,0.1)',borderWidth:1,
                 titleFont:{weight:'600'},bodyFont:{size:12},padding:10,
                 callbacks:{label:c=>`${c.dataset.label}: ${fmtL(c.raw)}`}}},
@@ -256,8 +343,7 @@ function renderPCR(data){
         data:{labels:data.timestamps,datasets:[{label:'PCR',data:data.pcr,borderColor:C.cyan,borderWidth:2,
             pointRadius:2,pointHoverRadius:5,fill:true,backgroundColor:'rgba(38,198,218,0.08)',tension:0.4}]},
         options:{responsive:true,maintainAspectRatio:false,
-            interaction:{mode:'index',intersect:false},
-            hover:{mode:'index',intersect:false},
+            interaction:{mode:'index',intersect:false},hover:{mode:'index',intersect:false},
             plugins:{tooltip:{enabled:true,backgroundColor:'rgba(20,22,32,0.95)',borderColor:'rgba(255,255,255,0.1)',borderWidth:1,
                 titleFont:{weight:'600'},bodyFont:{size:12},padding:10,
                 callbacks:{label:c=>`PCR: ${c.raw?.toFixed(4)}`}}},
@@ -270,6 +356,15 @@ function renderPCR(data){
 
 /* ═══ PRICE vs OI ═══ */
 async function loadPriceVsOI(){
+    if(currentMode==='historical'&&historicalDate){
+        // For historical, show message — per-strike historical not yet supported
+        showChartEmpty('chart-call-price-oi','Select Live mode for Price vs OI');
+        showChartEmpty('chart-put-price-oi','Select Live mode for Price vs OI');
+        showChartEmpty('chart-straddle','Select Live mode for Straddle');
+        document.getElementById('strike-list').innerHTML=
+            '<div class="strike-item">Historical mode</div>';
+        return;
+    }
     try{
         const sRes=await fetch('/api/strikes');
         const sData=await sRes.json();
@@ -303,7 +398,6 @@ window.selectStrike=function(strike){
         const num=parseFloat(el.textContent);
         el.classList.toggle('active',num===strike);
     });
-    // Immediately reload Price vs OI charts with new strike
     (async()=>{
         try{
             const res=await fetch(`/api/price-vs-oi?strike=${selectedStrike}`);
@@ -316,46 +410,33 @@ window.selectStrike=function(strike){
 };
 
 function renderCallPriceOI(data){
-    const ctx=document.getElementById('chart-call-price-oi');
-    if(!ctx) return;
+    const ctx=document.getElementById('chart-call-price-oi');if(!ctx) return;
     if(charts.callOI){charts.callOI.destroy();charts.callOI=null;}
-    const cd=data.call||[];
-    if(!cd.length) return;
+    const cd=data.call||[];if(!cd.length) return;
     const labels=cd.map(d=>(d.timestamp?.split('T')[1]||'').slice(0,5));
-    charts.callOI=new Chart(ctx,{
-        type:'line',
+    charts.callOI=new Chart(ctx,{type:'line',
         data:{labels,datasets:[
             {label:`${data.strike} CE OI`,data:cd.map(d=>d.oi),borderColor:C.green,borderWidth:2,pointRadius:2,pointHoverRadius:5,tension:0.3,yAxisID:'y',fill:true,backgroundColor:'rgba(38,166,154,0.08)'},
             {label:`${data.strike} CE Price`,data:cd.map(d=>d.price),borderColor:C.orange,borderWidth:2,pointRadius:2,pointHoverRadius:5,tension:0.3,yAxisID:'y1'},
-        ]},
-        options:dualOpts('OI','Price (₹)'),
-    });
+        ]},options:dualOpts('OI','Price (₹)')});
 }
 function renderPutPriceOI(data){
-    const ctx=document.getElementById('chart-put-price-oi');
-    if(!ctx) return;
+    const ctx=document.getElementById('chart-put-price-oi');if(!ctx) return;
     if(charts.putOI){charts.putOI.destroy();charts.putOI=null;}
-    const pd=data.put||[];
-    if(!pd.length) return;
+    const pd=data.put||[];if(!pd.length) return;
     const labels=pd.map(d=>(d.timestamp?.split('T')[1]||'').slice(0,5));
-    charts.putOI=new Chart(ctx,{
-        type:'line',
+    charts.putOI=new Chart(ctx,{type:'line',
         data:{labels,datasets:[
             {label:`${data.strike} PE OI`,data:pd.map(d=>d.oi),borderColor:C.red,borderWidth:2,pointRadius:2,pointHoverRadius:5,tension:0.3,yAxisID:'y',fill:true,backgroundColor:'rgba(239,83,80,0.08)'},
             {label:`${data.strike} PE Price`,data:pd.map(d=>d.price),borderColor:C.orange,borderWidth:2,pointRadius:2,pointHoverRadius:5,tension:0.3,yAxisID:'y1'},
-        ]},
-        options:dualOpts('OI','Price (₹)'),
-    });
+        ]},options:dualOpts('OI','Price (₹)')});
 }
 function renderStraddle(data){
-    const ctx=document.getElementById('chart-straddle');
-    if(!ctx) return;
+    const ctx=document.getElementById('chart-straddle');if(!ctx) return;
     if(charts.straddle){charts.straddle.destroy();charts.straddle=null;}
-    const sd=data.straddle||[];
-    if(!sd.length) return;
+    const sd=data.straddle||[];if(!sd.length) return;
     const labels=sd.map(d=>(d.timestamp?.split('T')[1]||'').slice(0,5));
-    charts.straddle=new Chart(ctx,{
-        type:'line',
+    charts.straddle=new Chart(ctx,{type:'line',
         data:{labels,datasets:[{label:'Straddle',data:sd.map(d=>d.price),borderColor:C.blue,borderWidth:2,
             pointRadius:2,pointHoverRadius:5,tension:0.3,fill:true,backgroundColor:'rgba(66,165,245,0.08)'}]},
         options:{responsive:true,maintainAspectRatio:false,
@@ -364,22 +445,17 @@ function renderStraddle(data){
                 titleFont:{weight:'600'},bodyFont:{size:12},padding:10,
                 callbacks:{label:c=>`Straddle: ₹${c.raw?.toFixed(2)}`}}},
             scales:{x:{grid:{display:false},ticks:{maxTicksLimit:10}},
-                y:{position:'left',grid:{color:'rgba(255,255,255,0.03)'},ticks:{callback:v=>'₹'+v.toFixed(0)}}},
-        },
-    });
+                y:{position:'left',grid:{color:'rgba(255,255,255,0.03)'},ticks:{callback:v=>'₹'+v.toFixed(0)}}}}});
 }
 function dualOpts(lbl,rbl){
     return{responsive:true,maintainAspectRatio:false,
-        interaction:{mode:'index',intersect:false},
-        hover:{mode:'index',intersect:false},
+        interaction:{mode:'index',intersect:false},hover:{mode:'index',intersect:false},
         plugins:{tooltip:{enabled:true,backgroundColor:'rgba(20,22,32,0.95)',borderColor:'rgba(255,255,255,0.1)',borderWidth:1,
             titleFont:{weight:'600'},bodyFont:{size:12},padding:10,
             callbacks:{label:c=>c.datasetIndex===0?`OI: ${fmtL(c.raw)}`:`Price: ₹${c.raw?.toFixed(2)}`}}},
         scales:{x:{grid:{display:false},ticks:{maxTicksLimit:10}},
             y:{position:'left',grid:{color:'rgba(255,255,255,0.03)'},ticks:{callback:v=>fmtL(v)},title:{display:true,text:lbl,color:'rgba(255,255,255,0.3)'}},
-            y1:{position:'right',grid:{display:false},ticks:{callback:v=>'₹'+v.toFixed(0)},title:{display:true,text:rbl,color:'rgba(255,255,255,0.3)'}},
-        },
-    };
+            y1:{position:'right',grid:{display:false},ticks:{callback:v=>'₹'+v.toFixed(0)},title:{display:true,text:rbl,color:'rgba(255,255,255,0.3)'}}}};
 }
 
 function fmtL(n){

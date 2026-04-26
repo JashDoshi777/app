@@ -462,7 +462,9 @@ async def get_historical(
                 SELECT timestamp, strike, ce_oi, pe_oi, ce_ltp, pe_ltp, ce_chg_oi, pe_chg_oi,
                        ce_iv, pe_iv, pe_ce_oi_diff, pcr, future_ltp
                 FROM oi_snapshots
-                WHERE symbol = 'NIFTY' AND DATE(timestamp) = %s AND strike = %s
+                WHERE symbol = 'NIFTY'
+                  AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+                  AND strike = %s
                 ORDER BY timestamp ASC
             """, (target_date, strike))
         else:
@@ -472,17 +474,22 @@ async def get_historical(
                        straddle_price, atm_strike, volume,
                        total_ce_volume, total_pe_volume
                 FROM market_snapshots
-                WHERE symbol = 'NIFTY' AND DATE(timestamp) = %s
+                WHERE symbol = 'NIFTY'
+                  AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
                 ORDER BY timestamp ASC
             """, (target_date,))
 
         columns = [desc[0] for desc in cur.description]
         rows = [dict(zip(columns, row)) for row in cur.fetchall()]
 
-        # Convert timestamps to strings
+        # Convert timestamps to IST strings
         for row in rows:
             if "timestamp" in row and row["timestamp"]:
-                row["timestamp"] = row["timestamp"].isoformat()
+                ts = row["timestamp"]
+                if hasattr(ts, 'astimezone'):
+                    row["timestamp"] = ts.astimezone(IST).isoformat()
+                else:
+                    row["timestamp"] = (ts + timedelta(hours=5, minutes=30)).isoformat()
 
         cur.close()
         conn.close()
@@ -507,7 +514,7 @@ async def get_historical_dates():
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
         cur.execute("""
-            SELECT DISTINCT DATE(timestamp) as dt
+            SELECT DISTINCT DATE(timestamp AT TIME ZONE 'Asia/Kolkata') as dt
             FROM market_snapshots
             WHERE symbol = 'NIFTY'
             ORDER BY dt DESC
@@ -534,14 +541,16 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
 
+        # Fetch in chronological order (ASC) so we can compute changes
         cur.execute("""
             SELECT timestamp, underlying_price, total_ce_oi, total_pe_oi,
                    pe_ce_oi_diff, pe_ce_oi_diff_change, pcr, future_ltp,
                    straddle_price, atm_strike, atm_ce_ltp, atm_pe_ltp,
                    volume, total_ce_volume, total_pe_volume
             FROM market_snapshots
-            WHERE symbol = 'NIFTY' AND DATE(timestamp) = %s
-            ORDER BY timestamp DESC
+            WHERE symbol = 'NIFTY'
+              AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+            ORDER BY timestamp ASC
         """, (date,))
 
         columns = [desc[0] for desc in cur.description]
@@ -552,45 +561,62 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         if not db_rows:
             return {"rows": [], "date": date}
 
-        # Timeframe sampling
-        if tf > 1 and len(db_rows) > 1:
-            db_rows = db_rows[::tf]
+        # Use first row as "day open" baseline
+        first_ce_oi = int(db_rows[0].get("total_ce_oi", 0) or 0)
+        first_pe_oi = int(db_rows[0].get("total_pe_oi", 0) or 0)
 
-        formatted = []
+        # Process chronologically to compute changes
+        all_rows = []
+        prev_ce_oi = 0
+        prev_pe_oi = 0
+        prev_pe_ce_diff = 0
         prev_ce_ltp = 0
         prev_pe_ltp = 0
 
         for r in db_rows:
             ts = r["timestamp"]
-            if hasattr(ts, 'strftime'):
-                time_str = ts.strftime("%H:%M")
+            if hasattr(ts, 'astimezone'):
+                ts_ist = ts.astimezone(IST)
+                time_str = ts_ist.strftime("%H:%M")
+            elif hasattr(ts, 'strftime'):
+                ts_ist = ts + timedelta(hours=5, minutes=30)
+                time_str = ts_ist.strftime("%H:%M")
             else:
                 time_str = str(ts)
 
-            atm_ce = float(r.get("atm_ce_ltp", 0) or 0)
-            atm_pe = float(r.get("atm_pe_ltp", 0) or 0)
-            ce_delta_chg = round(atm_ce - prev_ce_ltp, 2) if prev_ce_ltp > 0 else 0
-            pe_delta_chg = round(atm_pe - prev_pe_ltp, 2) if prev_pe_ltp > 0 else 0
-
             total_pe = int(r.get("total_pe_oi", 0) or 0)
             total_ce = int(r.get("total_ce_oi", 0) or 0)
-            pe_ce_diff = int(r.get("pe_ce_oi_diff", 0) or 0)
-            pe_ce_diff_chg = int(r.get("pe_ce_oi_diff_change", 0) or 0)
+            pe_ce_diff = total_pe - total_ce
             pcr_val = float(r.get("pcr", 0) or 0)
             straddle = float(r.get("straddle_price", 0) or 0)
             future = float(r.get("future_ltp", 0) or 0)
             atm = float(r.get("atm_strike", 0) or 0)
+            atm_ce = float(r.get("atm_ce_ltp", 0) or 0)
+            atm_pe = float(r.get("atm_pe_ltp", 0) or 0)
 
-            formatted.append({
+            # Change (Day) = current - first row of day
+            pe_chg_day = total_pe - first_pe_oi
+            ce_chg_day = total_ce - first_ce_oi
+
+            # Change (minute) = current - previous row
+            pe_chg_min = total_pe - prev_pe_oi if prev_pe_oi > 0 else 0
+            ce_chg_min = total_ce - prev_ce_oi if prev_ce_oi > 0 else 0
+            pe_ce_diff_chg = pe_ce_diff - prev_pe_ce_diff if prev_pe_ce_diff != 0 else 0
+            pe_ce_chg_day = pe_chg_day - ce_chg_day
+
+            ce_delta_chg = round(atm_ce - prev_ce_ltp, 2) if prev_ce_ltp > 0 else 0
+            pe_delta_chg = round(atm_pe - prev_pe_ltp, 2) if prev_pe_ltp > 0 else 0
+
+            all_rows.append({
                 "time": time_str,
                 "pe_oi_total": _fmt_lakh(total_pe),
-                "pe_oi_change_day": "0",
-                "pe_oi_change": "0",
+                "pe_oi_change_day": _fmt_lakh(pe_chg_day),
+                "pe_oi_change": _fmt_lakh(pe_chg_min),
                 "ce_oi_total": _fmt_lakh(total_ce),
-                "ce_oi_change_day": "0",
-                "ce_oi_change": "0",
+                "ce_oi_change_day": _fmt_lakh(ce_chg_day),
+                "ce_oi_change": _fmt_lakh(ce_chg_min),
                 "pe_ce_total": _fmt_lakh(pe_ce_diff),
-                "pe_ce_change_day": "0",
+                "pe_ce_change_day": _fmt_lakh(pe_ce_chg_day),
                 "pe_ce_change": _fmt_lakh(pe_ce_diff_chg),
                 "pcr": pcr_val,
                 "future_ltp": round(future, 2),
@@ -605,16 +631,26 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                     "pe_ce_diff": pe_ce_diff,
                     "pe_ce_diff_change": pe_ce_diff_chg,
                     "pcr": pcr_val,
-                    "pe_oi_change_day": 0,
-                    "ce_oi_change_day": 0,
-                    "pe_oi_change": 0,
-                    "ce_oi_change": 0,
+                    "pe_oi_change_day": pe_chg_day,
+                    "ce_oi_change_day": ce_chg_day,
+                    "pe_oi_change": pe_chg_min,
+                    "ce_oi_change": ce_chg_min,
                 },
             })
+            prev_ce_oi = total_ce
+            prev_pe_oi = total_pe
+            prev_pe_ce_diff = pe_ce_diff
             prev_ce_ltp = atm_ce
             prev_pe_ltp = atm_pe
 
-        return _sanitize({"rows": formatted, "date": date, "mode": "historical"})
+        # Timeframe sampling (after computing changes)
+        if tf > 1 and len(all_rows) > 1:
+            all_rows = all_rows[::tf]
+
+        # Reverse to newest-first for display
+        all_rows.reverse()
+
+        return _sanitize({"rows": all_rows, "date": date, "mode": "historical"})
 
     except Exception as e:
         logger.error("Historical OI table failed: %s", e)
