@@ -49,6 +49,7 @@ data_buffer = {
     "prev_pe_ce_diff": 0,
     "prev_total_ce_oi": 0,
     "prev_total_pe_oi": 0,
+    "prev_total_oi": 0,
     "db_available": False,
     "last_log_time": None,
     "total_logs": 0,
@@ -141,8 +142,10 @@ def data_logger_loop(state):
             atm_pe_ltp = float(atm_row["pe_ltp"].iloc[0]) if not atm_row.empty else 0
             straddle = round(atm_ce_ltp + atm_pe_ltp, 2)
 
-            # Future LTP (use underlying as proxy if no separate future feed)
-            future_ltp = underlying
+            # Future LTP (use actual NIFTY Futures, not spot)
+            future_ltp = md.get_futures_ltp("NIFTY")
+            if future_ltp <= 0:
+                future_ltp = underlying  # Fallback to spot
 
             # ── Build 1-min candle ───────────────────────
             current_minute = now_ist.minute
@@ -187,6 +190,7 @@ def data_logger_loop(state):
                 "atm_strike": atm,
                 "atm_ce_ltp": atm_ce_ltp,
                 "atm_pe_ltp": atm_pe_ltp,
+                "signal": _compute_signal(underlying, data_buffer, total_ce_oi + total_pe_oi),
             }
             data_buffer["oi_table"].appendleft(snapshot)
 
@@ -217,6 +221,7 @@ def data_logger_loop(state):
             data_buffer["prev_pe_ce_diff"] = pe_ce_diff
             data_buffer["prev_total_ce_oi"] = total_ce_oi
             data_buffer["prev_total_pe_oi"] = total_pe_oi
+            data_buffer["prev_total_oi"] = total_ce_oi + total_pe_oi
             data_buffer["last_log_time"] = now_ist.isoformat()
             data_buffer["total_logs"] += 1
             data_buffer["data_source"] = getattr(md, '_data_source_log', 'UNKNOWN')
@@ -260,6 +265,38 @@ def _fmt_lakh(n):
     if abs(n) >= 1000:
         return f"{n/1000:.1f} K"
     return str(n)
+
+
+def _compute_signal(current_price, data_buffer, current_total_oi):
+    """
+    Compute market signal based on price direction + total OI direction.
+    Matches StockMojo's OI buildup classification:
+    - LB: Long Buildup  (Price ↑, Total OI ↑) — fresh longs entering
+    - SB: Short Buildup (Price ↓, Total OI ↑) — fresh shorts entering
+    - SC: Short Covering (Price ↑, Total OI ↓) — shorts exiting
+    - LU: Long Unwinding (Price ↓, Total OI ↓) — longs exiting
+    """
+    prev_price = data_buffer.get("_prev_underlying", 0)
+    prev_total_oi = data_buffer.get("prev_total_oi", 0)
+
+    if prev_price <= 0 or prev_total_oi <= 0:
+        data_buffer["_prev_underlying"] = current_price
+        return "S"
+
+    price_up = current_price > prev_price
+    oi_up = current_total_oi > prev_total_oi
+
+    data_buffer["_prev_underlying"] = current_price
+
+    if price_up and oi_up:
+        return "LB"  # Long Buildup
+    elif not price_up and oi_up:
+        return "SB"  # Short Buildup
+    elif price_up and not oi_up:
+        return "SC"  # Short Covering
+    elif not price_up and not oi_up:
+        return "LU"  # Long Unwinding
+    return "S"
 
 
 def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp, pcr, pe_ce_diff, pe_ce_diff_change, straddle, atm, atm_ce_ltp, atm_pe_ltp, total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol):
@@ -427,6 +464,12 @@ def main():
 
     logger.info("Data Tier: %s", market_data.data_tier)
     logger.info("DB: %s", "CONNECTED" if db_ok else "DISABLED")
+
+    # Load previous day's closing OI from DB for accurate Chg Day computation
+    if db_ok:
+        db_url = os.environ.get("DATABASE_URL", config.DATABASE_URL)
+        if db_url:
+            market_data.load_prev_day_oi_from_db(db_url)
 
     # Health endpoint for HuggingFace container monitoring
     @app.get("/health")

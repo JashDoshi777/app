@@ -117,8 +117,18 @@ class MarketDataService:
         self._smart_api = None  # Store SmartAPI session for REST calls
         self._instrument_df = None  # Instrument master for option token lookup
         self._data_source_log = "NONE"  # Track where data actually came from
-        self._day_open_oi = {}  # Track first-seen OI per strike for change calculation
+        # Previous day's closing OI per strike — loaded from DB at startup
+        # Key format: "{strike}_{ce|pe}" -> OI value
+        self._prev_day_close_oi = {}  # Previous trading day's final OI
+        self._prev_day_oi_loaded = False  # Whether prev day OI was loaded
+        self._day_open_oi = {}  # Fallback: first-seen OI if no DB data
         self._day_open_date = None  # Reset tracking on new day
+        # Futures LTP
+        self._futures_token = None  # Angel One token for NIFTY FUT
+        self._futures_ltp = 0.0
+        # Store credentials for re-authentication
+        self._angel_credentials = {}
+        self._last_reauth_attempt = 0  # Prevent rapid re-auth loops
 
         # Rate limit tracking
         self._yf_last_call: float = 0
@@ -183,8 +193,19 @@ class MarketDataService:
                 # Store SmartAPI object for REST calls (option chain)
                 self._smart_api = smart_api
 
+                # Store credentials for re-authentication on token expiry
+                self._angel_credentials = {
+                    "api_key": api_key,
+                    "client_id": client_id,
+                    "password": password,
+                    "totp_secret": totp_secret,
+                }
+
                 # Download instrument master for option token lookups
                 self._load_instrument_master()
+
+                # Find NIFTY FUT token for futures LTP
+                self._find_futures_token()
 
                 # Start WebSocket in background thread
                 self._start_websocket(jwt_token, api_key, client_id, feed_token)
@@ -216,17 +237,25 @@ class MarketDataService:
                                         self._prices[sym] = ltp
                                         self._price_timestamps[sym] = time.time()
                                     break
+                            # Check if it's the futures token
+                            if self._futures_token and token == self._futures_token:
+                                with self._lock:
+                                    self._futures_ltp = ltp
                     except Exception as e:
                         logger.debug("WS tick error: %s", e)
 
                 def on_open(wsapp):
                     logger.info("WebSocket connected - subscribing to instruments...")
                     # Subscribe to NIFTY and BANKNIFTY LTP (mode 1 = LTP only)
-                    tokens = [
+                    sub_tokens = [
                         {"exchangeType": 1, "tokens": [SMARTAPI_TOKENS["NIFTY"]]},
                         {"exchangeType": 1, "tokens": [SMARTAPI_TOKENS["BANKNIFTY"]]},
                     ]
-                    sws.subscribe("nifty_bn", 1, tokens)
+                    # Also subscribe to NIFTY FUT if token found
+                    if self._futures_token:
+                        sub_tokens.append({"exchangeType": 2, "tokens": [self._futures_token]})
+                        logger.info("Subscribing to NIFTY FUT token: %s", self._futures_token)
+                    sws.subscribe("nifty_bn", 1, sub_tokens)
                     self._ws_connected = True
 
                 def on_error(wsapp, error):
@@ -234,14 +263,26 @@ class MarketDataService:
                     self._ws_connected = False
 
                 def on_close(wsapp):
-                    logger.warning("WebSocket disconnected. Reconnecting in 5s...")
+                    logger.warning("WebSocket disconnected. Attempting re-auth in 5s...")
                     self._ws_connected = False
                     time.sleep(5)
-                    # Auto-reconnect
+                    # Re-authenticate with fresh JWT before reconnecting
                     try:
-                        sws.connect()
-                    except Exception:
-                        pass
+                        if self._reauth_smartapi():
+                            feed_token = self._smart_api.getfeedToken()
+                            new_jwt = self._smart_api._jwtToken if hasattr(self._smart_api, '_jwtToken') else jwt_token
+                            creds = self._angel_credentials
+                            new_sws = SmartWebSocketV2(new_jwt, creds["api_key"], creds["client_id"], feed_token)
+                            new_sws.on_data = on_data
+                            new_sws.on_open = on_open
+                            new_sws.on_error = on_error
+                            new_sws.on_close = on_close
+                            self._ws = new_sws
+                            new_sws.connect()
+                        else:
+                            logger.error("WebSocket re-auth failed, will retry on next data cycle")
+                    except Exception as re_e:
+                        logger.error("WebSocket reconnect failed: %s", re_e)
 
                 sws.on_data = on_data
                 sws.on_open = on_open
@@ -267,6 +308,185 @@ class MarketDataService:
         except Exception as e:
             logger.warning("Instrument master download failed: %s", e)
             self._instrument_df = None
+
+    def _find_futures_token(self):
+        """Find nearest-month NIFTY FUT token from instrument master."""
+        if self._instrument_df is None or self._instrument_df.empty:
+            return
+        try:
+            df = self._instrument_df
+            fut = df[(df["exch_seg"] == "NFO") & (df["name"] == "NIFTY") &
+                     (df["instrumenttype"] == "FUTIDX")].copy()
+            if fut.empty:
+                logger.warning("No NIFTY FUT contracts found in instrument master")
+                return
+            fut["expiry_dt"] = pd.to_datetime(fut["expiry"], format="%d%b%Y", errors="coerce")
+            future_only = fut[fut["expiry_dt"] >= datetime.now(IST).replace(tzinfo=None)]
+            if future_only.empty:
+                return
+            nearest = future_only.loc[future_only["expiry_dt"].idxmin()]
+            self._futures_token = str(nearest["token"])
+            logger.info("[OK] NIFTY FUT token: %s (expiry: %s)",
+                        self._futures_token, nearest["expiry"])
+        except Exception as e:
+            logger.warning("Failed to find NIFTY FUT token: %s", e)
+
+    def get_futures_ltp(self, symbol: str = "NIFTY") -> float:
+        """
+        Get NIFTY Futures LTP.
+        Priority: WebSocket cache -> REST API call -> spot price fallback.
+        """
+        # Check WebSocket cache first
+        with self._lock:
+            if self._futures_ltp > 0:
+                return self._futures_ltp
+
+        # Try REST API call
+        if self._smart_api and self._futures_token:
+            try:
+                result = self._smart_api.getMarketData(
+                    mode="LTP",
+                    exchangeTokens={"NFO": [self._futures_token]}
+                )
+                if result and result.get("data") and result["data"].get("fetched"):
+                    item = result["data"]["fetched"][0]
+                    ltp = float(item.get("ltp", 0))
+                    if ltp > 0:
+                        with self._lock:
+                            self._futures_ltp = ltp
+                        return ltp
+                else:
+                    # Check for token expiry — auto re-authenticate
+                    if result and isinstance(result, dict):
+                        msg = str(result.get("message", "")).lower()
+                        err_code = str(result.get("errorCode", ""))
+                        if "invalid token" in msg or err_code == "AG8001":
+                            logger.warning("[TOKEN EXPIRED] Futures LTP — attempting re-auth")
+                            if self._reauth_smartapi():
+                                retry = self._smart_api.getMarketData(
+                                    mode="LTP",
+                                    exchangeTokens={"NFO": [self._futures_token]}
+                                )
+                                if retry and retry.get("data") and retry["data"].get("fetched"):
+                                    ltp = float(retry["data"]["fetched"][0].get("ltp", 0))
+                                    if ltp > 0:
+                                        with self._lock:
+                                            self._futures_ltp = ltp
+                                        return ltp
+            except Exception as e:
+                logger.debug("Futures LTP REST failed: %s", e)
+
+        # Fallback to spot
+        return self.get_ltp(symbol) or 0
+
+    def load_prev_day_oi_from_db(self, db_url: str):
+        """
+        Load previous trading day's closing OI from database.
+        This is critical for accurate 'Chg Day' computation (matching StockMojo/NSE).
+        """
+        if not db_url:
+            logger.warning("No DB URL — cannot load prev day OI, will use first-fetch baseline")
+            return
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(db_url)
+            cur = conn.cursor()
+
+            # Find the most recent trading day before today
+            today = datetime.now(IST).strftime("%Y-%m-%d")
+            cur.execute("""
+                SELECT DISTINCT DATE(timestamp AT TIME ZONE 'Asia/Kolkata') as dt
+                FROM oi_snapshots
+                WHERE symbol = 'NIFTY'
+                  AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') < %s
+                ORDER BY dt DESC
+                LIMIT 1
+            """, (today,))
+            row = cur.fetchone()
+            if not row:
+                logger.warning("No previous day OI data in DB — will use first-fetch baseline")
+                cur.close()
+                conn.close()
+                return
+
+            prev_date = row[0].strftime("%Y-%m-%d")
+
+            # Get the LAST snapshot from that day (closing OI)
+            cur.execute("""
+                SELECT timestamp FROM oi_snapshots
+                WHERE symbol = 'NIFTY'
+                  AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (prev_date,))
+            last_ts_row = cur.fetchone()
+            if not last_ts_row:
+                cur.close()
+                conn.close()
+                return
+
+            last_ts = last_ts_row[0]
+
+            # Load all strike OI from that last timestamp
+            cur.execute("""
+                SELECT strike, ce_oi, pe_oi
+                FROM oi_snapshots
+                WHERE symbol = 'NIFTY'
+                  AND timestamp = %s
+            """, (last_ts,))
+
+            count = 0
+            for strike_row in cur.fetchall():
+                strike = float(strike_row[0])
+                ce_oi = int(strike_row[1] or 0)
+                pe_oi = int(strike_row[2] or 0)
+                self._prev_day_close_oi[f"{strike}_ce"] = ce_oi
+                self._prev_day_close_oi[f"{strike}_pe"] = pe_oi
+                count += 1
+
+            self._prev_day_oi_loaded = True
+            cur.close()
+            conn.close()
+            logger.info("[OK] Loaded prev day closing OI: %d strikes from %s", count, prev_date)
+
+        except Exception as e:
+            logger.error("Failed to load prev day OI: %s", e)
+            self._prev_day_oi_loaded = False
+
+    def _reauth_smartapi(self) -> bool:
+        """
+        Re-authenticate with Angel One when JWT token expires.
+        Returns True on success, False on failure.
+        """
+        # Prevent rapid re-auth loops (max once per 60 seconds)
+        now = time.time()
+        if now - self._last_reauth_attempt < 60:
+            return False
+        self._last_reauth_attempt = now
+
+        creds = self._angel_credentials
+        if not creds:
+            logger.error("Cannot re-auth: no stored credentials")
+            return False
+
+        try:
+            logger.info("[REAUTH] Angel One token expired — re-authenticating...")
+            smart_api = SmartConnect(api_key=creds["api_key"])
+            totp = pyotp.TOTP(creds["totp_secret"]).now()
+            session_data = smart_api.generateSession(
+                creds["client_id"], creds["password"], totp
+            )
+            if session_data.get("status"):
+                self._smart_api = smart_api
+                logger.info("[REAUTH] Success — Angel One session restored")
+                return True
+            else:
+                logger.error("[REAUTH] Failed: %s", session_data.get("message", "unknown"))
+                return False
+        except Exception as e:
+            logger.error("[REAUTH] Exception: %s", e)
+            return False
 
     def _get_option_tokens(self, symbol: str = "NIFTY", underlying_price: float = 0):
         """Get Angel One tokens for option contracts near ATM."""
@@ -351,8 +571,36 @@ class MarketDataService:
                 )
 
                 if not result or not result.get("data") or not result["data"].get("fetched"):
-                    logger.warning("getMarketData returned no data for batch %d", i)
-                    continue
+                    # Check for token expiry — auto re-authenticate
+                    if result and isinstance(result, dict):
+                        msg = str(result.get("message", "")).lower()
+                        err_code = str(result.get("errorCode", ""))
+                        if "invalid token" in msg or err_code == "AG8001":
+                            logger.warning("[TOKEN EXPIRED] Detected Invalid Token — attempting re-auth")
+                            if self._reauth_smartapi():
+                                # Retry this batch after re-auth
+                                try:
+                                    result = self._smart_api.getMarketData(
+                                        mode="FULL",
+                                        exchangeTokens={"NFO": batch}
+                                    )
+                                    if result and result.get("data") and result["data"].get("fetched"):
+                                        # Success! Process below
+                                        pass
+                                    else:
+                                        logger.warning("getMarketData still failed after re-auth")
+                                        continue
+                                except Exception as re_e:
+                                    logger.error("Retry after re-auth failed: %s", re_e)
+                                    continue
+                            else:
+                                continue
+                        else:
+                            logger.warning("getMarketData returned no data for batch %d", i)
+                            continue
+                    else:
+                        logger.warning("getMarketData returned no data for batch %d", i)
+                        continue
 
                 for item in result["data"]["fetched"]:
                     token = str(item.get("symbolToken", ""))
@@ -371,21 +619,27 @@ class MarketDataService:
                         }
 
                     strikes_data[strike][f"{prefix}_ltp"] = float(item.get("ltp", 0))
-                    strikes_data[strike][f"{prefix}_oi"] = int(item.get("opnInterest", 0))
+                    current_oi = int(item.get("opnInterest", 0))
+                    strikes_data[strike][f"{prefix}_oi"] = current_oi
                     strikes_data[strike][f"{prefix}_volume"] = int(item.get("tradeVolume", 0))
 
-                    # OI change: track from day-open (first snapshot of the day)
-                    current_oi = int(item.get("opnInterest", 0))
-                    today = datetime.now(IST).date()
-                    if self._day_open_date != today:
-                        self._day_open_oi = {}
-                        self._day_open_date = today
-
+                    # OI change: compute vs PREVIOUS DAY's closing OI (matches NSE/StockMojo)
                     oi_key = f"{strike}_{prefix}"
-                    if oi_key not in self._day_open_oi:
-                        self._day_open_oi[oi_key] = current_oi
 
-                    strikes_data[strike][f"{prefix}_chg_oi"] = current_oi - self._day_open_oi[oi_key]
+                    if self._prev_day_oi_loaded and oi_key in self._prev_day_close_oi:
+                        # Best: use actual previous day close from DB
+                        prev_close_oi = self._prev_day_close_oi[oi_key]
+                    else:
+                        # Fallback: use first-seen OI of the day
+                        today = datetime.now(IST).date()
+                        if self._day_open_date != today:
+                            self._day_open_oi = {}
+                            self._day_open_date = today
+                        if oi_key not in self._day_open_oi:
+                            self._day_open_oi[oi_key] = current_oi
+                        prev_close_oi = self._day_open_oi[oi_key]
+
+                    strikes_data[strike][f"{prefix}_chg_oi"] = current_oi - prev_close_oi
                     strikes_data[strike][f"{prefix}_iv"] = 0  # IV not in this endpoint
 
             except Exception as e:

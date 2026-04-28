@@ -70,7 +70,7 @@ def _fmt_lakh(n):
 #  HELPER: Recompute OI totals from per-strike data + range
 # ═══════════════════════════════════════════════════════════
 
-def _compute_ranged_snapshot(strike_snap, atm_strike, range_strikes):
+def _compute_ranged_snapshot(strike_snap, atm_strike, range_strikes, strike_interval=50):
     """
     Given a per-strike snapshot (list of strike dicts) and a range,
     recompute total OI/volume/pcr/pe_ce_diff for only strikes within range.
@@ -80,7 +80,7 @@ def _compute_ranged_snapshot(strike_snap, atm_strike, range_strikes):
         return None
 
     filtered = [s for s in strike_snap
-                if abs(s["strike"] - atm_strike) <= range_strikes * 50]
+                if abs(s["strike"] - atm_strike) <= range_strikes * strike_interval]
 
     if not filtered:
         return None
@@ -172,6 +172,8 @@ async def get_oi_table(
     prev_ce_ltp = 0
     prev_pe_ltp = 0
     prev_pe_ce_diff = 0
+    prev_price = 0
+    prev_total_oi = 0
 
     for r in chrono:
         ts = r["timestamp"]  # "HH:MM"
@@ -208,6 +210,29 @@ async def get_oi_table(
         ce_delta_chg = round(r["atm_ce_ltp"] - prev_ce_ltp, 2) if prev_ce_ltp > 0 else 0
         pe_delta_chg = round(r["atm_pe_ltp"] - prev_pe_ltp, 2) if prev_pe_ltp > 0 else 0
 
+        # Signal: use pre-computed from snapshot, or compute from price+OI
+        signal = r.get("signal", "")
+        if not signal:
+            cur_price = r.get("underlying", r.get("future_ltp", 0))
+            cur_total_oi = (raw.get("total_pe_oi", 0) or 0) + (raw.get("total_ce_oi", 0) or 0)
+            if prev_price > 0 and prev_total_oi > 0:
+                price_up = cur_price > prev_price
+                oi_up = cur_total_oi > prev_total_oi
+                if price_up and oi_up:
+                    signal = "LB"
+                elif not price_up and oi_up:
+                    signal = "SB"
+                elif price_up and not oi_up:
+                    signal = "SC"
+                elif not price_up and not oi_up:
+                    signal = "LU"
+                else:
+                    signal = "S"
+            else:
+                signal = "S"
+            prev_price = cur_price
+            prev_total_oi = cur_total_oi
+
         formatted.append({
             "time": ts,
             "pe_oi_total": _fmt_lakh(total_pe_oi),
@@ -225,6 +250,7 @@ async def get_oi_table(
             "atm_strike": r["atm_strike"],
             "ce_delta_chg": ce_delta_chg,
             "pe_delta_chg": pe_delta_chg,
+            "signal": signal,
             "_raw": {
                 **r,
                 "total_pe_oi": total_pe_oi,
@@ -758,15 +784,52 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         cur.close()
         conn.close()
 
-        # Use first row as "day open" baseline
-        if ranged_by_ts:
-            first_ts = ms_rows[0]["timestamp"]
-            first_ranged = ranged_by_ts.get(first_ts)
-            first_ce_oi = first_ranged["ce"] if first_ranged else int(ms_rows[0].get("total_ce_oi", 0) or 0)
-            first_pe_oi = first_ranged["pe"] if first_ranged else int(ms_rows[0].get("total_pe_oi", 0) or 0)
-        else:
-            first_ce_oi = int(ms_rows[0].get("total_ce_oi", 0) or 0)
-            first_pe_oi = int(ms_rows[0].get("total_pe_oi", 0) or 0)
+        # Query PREVIOUS day's closing OI for accurate "Chg Day" (matches StockMojo)
+        prev_day_ce_oi = 0
+        prev_day_pe_oi = 0
+        try:
+            conn2 = psycopg2.connect(db_url)
+            cur2 = conn2.cursor()
+            # Find the most recent trading day before the requested date
+            cur2.execute("""
+                SELECT DISTINCT DATE(timestamp AT TIME ZONE 'Asia/Kolkata') as dt
+                FROM market_snapshots
+                WHERE symbol = 'NIFTY'
+                  AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') < %s
+                ORDER BY dt DESC
+                LIMIT 1
+            """, (date,))
+            prev_row = cur2.fetchone()
+            if prev_row:
+                prev_date = prev_row[0].strftime("%Y-%m-%d")
+                # Get the LAST snapshot from that previous day (closing values)
+                cur2.execute("""
+                    SELECT total_ce_oi, total_pe_oi FROM market_snapshots
+                    WHERE symbol = 'NIFTY'
+                      AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (prev_date,))
+                close_row = cur2.fetchone()
+                if close_row:
+                    prev_day_ce_oi = int(close_row[0] or 0)
+                    prev_day_pe_oi = int(close_row[1] or 0)
+                    logger.debug("Hist baseline from prev day %s: CE=%d, PE=%d", prev_date, prev_day_ce_oi, prev_day_pe_oi)
+            cur2.close()
+            conn2.close()
+        except Exception as e:
+            logger.debug("Failed to load prev day baseline for historical: %s", e)
+
+        # Fallback: if no previous day data, use first row of current day
+        if prev_day_ce_oi == 0 and prev_day_pe_oi == 0:
+            if ranged_by_ts:
+                first_ts = ms_rows[0]["timestamp"]
+                first_ranged = ranged_by_ts.get(first_ts)
+                prev_day_ce_oi = first_ranged["ce"] if first_ranged else int(ms_rows[0].get("total_ce_oi", 0) or 0)
+                prev_day_pe_oi = first_ranged["pe"] if first_ranged else int(ms_rows[0].get("total_pe_oi", 0) or 0)
+            else:
+                prev_day_ce_oi = int(ms_rows[0].get("total_ce_oi", 0) or 0)
+                prev_day_pe_oi = int(ms_rows[0].get("total_pe_oi", 0) or 0)
 
         all_rows = []
         prev_ce_oi = 0
@@ -774,6 +837,8 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         prev_pe_ce_diff = 0
         prev_ce_ltp = 0
         prev_pe_ltp = 0
+        prev_price_hist = 0
+        prev_total_oi_hist = 0
 
         for r in ms_rows:
             ts = r["timestamp"]
@@ -803,8 +868,8 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
             atm_ce = float(r.get("atm_ce_ltp", 0) or 0)
             atm_pe = float(r.get("atm_pe_ltp", 0) or 0)
 
-            pe_chg_day = total_pe - first_pe_oi
-            ce_chg_day = total_ce - first_ce_oi
+            pe_chg_day = total_pe - prev_day_pe_oi
+            ce_chg_day = total_ce - prev_day_ce_oi
             pe_chg_min = total_pe - prev_pe_oi if prev_pe_oi > 0 else 0
             ce_chg_min = total_ce - prev_ce_oi if prev_ce_oi > 0 else 0
             pe_ce_diff_chg = pe_ce_diff - prev_pe_ce_diff if prev_pe_ce_diff != 0 else 0
@@ -830,6 +895,9 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                 "atm_strike": atm,
                 "ce_delta_chg": ce_delta_chg,
                 "pe_delta_chg": pe_delta_chg,
+                "signal": _compute_hist_signal(
+                    float(r.get("underlying_price", 0) or 0), prev_price_hist,
+                    total_ce + total_pe, prev_total_oi_hist),
                 "_raw": {
                     "underlying": float(r.get("underlying_price", 0) or 0),
                     "total_pe_oi": total_pe,
@@ -843,9 +911,11 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                     "ce_oi_change": ce_chg_min,
                 },
             })
+            prev_price_hist = float(r.get("underlying_price", 0) or 0)
             prev_ce_oi = total_ce
             prev_pe_oi = total_pe
             prev_pe_ce_diff = pe_ce_diff
+            prev_total_oi_hist = total_ce + total_pe
             prev_ce_ltp = atm_ce
             prev_pe_ltp = atm_pe
 
@@ -861,4 +931,24 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
     except Exception as e:
         logger.error("Historical OI table failed: %s", e)
         return {"rows": [], "error": str(e)}
+
+
+def _compute_hist_signal(cur_price, prev_price, cur_total_oi, prev_total_oi):
+    """
+    Compute signal for historical data.
+    Matches StockMojo: LB/SB/SC/LU based on price direction + total OI direction.
+    """
+    if prev_price <= 0 or prev_total_oi <= 0:
+        return "S"
+    price_up = cur_price > prev_price
+    oi_up = cur_total_oi > prev_total_oi
+    if price_up and oi_up:
+        return "LB"
+    elif not price_up and oi_up:
+        return "SB"
+    elif price_up and not oi_up:
+        return "SC"
+    elif not price_up and not oi_up:
+        return "LU"
+    return "S"
 

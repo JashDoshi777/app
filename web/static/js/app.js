@@ -161,8 +161,9 @@ async function loadOITable(){
         const tbody=document.getElementById('oi-table-body');
         tbody.innerHTML=data.rows.map(r=>{
             const raw=r._raw||{};
-            const signal=r.pcr>1.2?'up':r.pcr<0.8?'down':'side';
-            const sigTxt=r.pcr>1.2?'LU':r.pcr<0.8?'SC':'S';
+            // Use signal from backend (LB/SB/SC/LU/S)
+            const sig=r.signal||'S';
+            const sigClass=sig==='LB'||sig==='SC'?'up':sig==='SB'||sig==='LU'?'down':'side';
             const peCol=showChange?r.pe_oi_change_day:r.pe_oi_total;
             const ceCol=showChange?r.ce_oi_change_day:r.ce_oi_total;
             return `<tr>
@@ -182,7 +183,7 @@ async function loadOITable(){
                 <td class="val-neutral">${r.atm_strike}</td>
                 <td class="${vc(r.ce_delta_chg)}">${r.ce_delta_chg>0?'+':''}${r.ce_delta_chg}</td>
                 <td class="${vc(r.pe_delta_chg)}">${r.pe_delta_chg>0?'+':''}${r.pe_delta_chg}</td>
-                <td><span class="signal-badge signal-${signal}">${sigTxt}</span></td>
+                <td><span class="signal-badge signal-${sigClass}">${sig}</span></td>
             </tr>`;
         }).join('');
     }catch(e){console.error('OI Table:',e);}

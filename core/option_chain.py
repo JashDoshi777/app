@@ -197,10 +197,14 @@ class OptionChainAnalyzer:
         max_pain_strike = strikes[len(strikes) // 2]
 
         for s in strikes:
+            # Call writers' pain: calls are ITM when settlement (s) > strike (K)
+            # Pain = sum of max(0, s - K) * ce_oi for all strikes K
             ce_pain = sum(
                 max(0, s - row["strike"]) * row["ce_oi"]
                 for _, row in df.iterrows()
             )
+            # Put writers' pain: puts are ITM when strike (K) > settlement (s)
+            # Pain = sum of max(0, K - s) * pe_oi for all strikes K
             pe_pain = sum(
                 max(0, row["strike"] - s) * row["pe_oi"]
                 for _, row in df.iterrows()
