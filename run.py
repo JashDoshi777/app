@@ -134,18 +134,21 @@ def data_logger_loop(state):
             pe_ce_diff_change = pe_ce_diff - data_buffer["prev_pe_ce_diff"]
             pcr = round(total_pe_oi / max(total_ce_oi, 1), 4)
 
-            # ATM strike
+            # Future LTP — compute FIRST (needed for accurate ATM)
+            future_ltp = md.get_futures_ltp("NIFTY")
+            if future_ltp <= 0:
+                future_ltp = underlying  # Fallback to spot
+
+            # ATM strike — use Futures LTP for ATM (matches StockMojo)
+            # StockMojo uses futures price for ATM, not spot.
+            # e.g. Spot=24160, Futures=24232 → ATM should be 24250, not 24150
             strike_interval = config.INDICES["NIFTY"]["strike_interval"]
-            atm = round(underlying / strike_interval) * strike_interval
+            atm_price = future_ltp if future_ltp > 0 else underlying
+            atm = round(atm_price / strike_interval) * strike_interval
             atm_row = chain_df[chain_df["strike"] == atm]
             atm_ce_ltp = float(atm_row["ce_ltp"].iloc[0]) if not atm_row.empty else 0
             atm_pe_ltp = float(atm_row["pe_ltp"].iloc[0]) if not atm_row.empty else 0
             straddle = round(atm_ce_ltp + atm_pe_ltp, 2)
-
-            # Future LTP (use actual NIFTY Futures, not spot)
-            future_ltp = md.get_futures_ltp("NIFTY")
-            if future_ltp <= 0:
-                future_ltp = underlying  # Fallback to spot
 
             # ── Build 1-min candle ───────────────────────
             current_minute = now_ist.minute
@@ -172,6 +175,7 @@ def data_logger_loop(state):
                 candle_volume += total_ce_vol + total_pe_vol
 
             # ── Market snapshot for table ────────────────
+            futures_oi = md.get_futures_oi("NIFTY") if hasattr(md, 'get_futures_oi') else 0
             snapshot = {
                 "timestamp": now_ist.strftime("%H:%M"),
                 "timestamp_full": now_ist.isoformat(),
@@ -186,11 +190,12 @@ def data_logger_loop(state):
                 "pe_ce_diff_change": pe_ce_diff_change,
                 "pcr": pcr,
                 "future_ltp": future_ltp,
+                "futures_oi": futures_oi,
                 "straddle": straddle,
                 "atm_strike": atm,
                 "atm_ce_ltp": atm_ce_ltp,
                 "atm_pe_ltp": atm_pe_ltp,
-                "signal": _compute_signal(underlying, data_buffer, total_ce_oi + total_pe_oi),
+                "signal": _compute_signal(future_ltp, data_buffer, total_ce_oi + total_pe_oi),
             }
             data_buffer["oi_table"].appendleft(snapshot)
 
@@ -275,18 +280,26 @@ def _compute_signal(current_price, data_buffer, current_total_oi):
     - SB: Short Buildup (Price ↓, Total OI ↑) — fresh shorts entering
     - SC: Short Covering (Price ↑, Total OI ↓) — shorts exiting
     - LU: Long Unwinding (Price ↓, Total OI ↓) — longs exiting
+    - N/A: No clear signal (price or OI unchanged)
     """
     prev_price = data_buffer.get("_prev_underlying", 0)
     prev_total_oi = data_buffer.get("prev_total_oi", 0)
 
     if prev_price <= 0 or prev_total_oi <= 0:
         data_buffer["_prev_underlying"] = current_price
-        return "S"
+        return "N/A"
+
+    # StockMojo shows N/A when price or OI is unchanged between minutes
+    price_changed = abs(current_price - prev_price) > 0.01
+    oi_changed = current_total_oi != prev_total_oi
+
+    data_buffer["_prev_underlying"] = current_price
+
+    if not price_changed or not oi_changed:
+        return "N/A"
 
     price_up = current_price > prev_price
     oi_up = current_total_oi > prev_total_oi
-
-    data_buffer["_prev_underlying"] = current_price
 
     if price_up and oi_up:
         return "LB"  # Long Buildup
@@ -296,7 +309,7 @@ def _compute_signal(current_price, data_buffer, current_total_oi):
         return "SC"  # Short Covering
     elif not price_up and not oi_up:
         return "LU"  # Long Unwinding
-    return "S"
+    return "N/A"
 
 
 def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp, pcr, pe_ce_diff, pe_ce_diff_change, straddle, atm, atm_ce_ltp, atm_pe_ltp, total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol):

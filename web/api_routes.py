@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Query
 from typing import Optional
 import numpy as np
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +126,24 @@ async def market_status():
     }
 
 
+@router.get("/expiry-info")
+async def expiry_info():
+    """Return nearest expiry date + days-to-expiry for the dashboard badge."""
+    md = _engine_state.get("market_data")
+    if md and hasattr(md, 'get_nearest_expiry_info'):
+        info = md.get_nearest_expiry_info("NIFTY")
+    else:
+        info = {"expiry": "--", "dte": 0, "label": "--", "expiry_date": ""}
+    return info
+
+
 @router.get("/oi-table")
 async def get_oi_table(
     tf: int = Query(1, description="Timeframe in minutes (1,3,5,15,60)"),
     range_strikes: int = Query(10, description="Number of strikes from ATM each side"),
     mode: str = Query("live", description="live or historical"),
     date: str = Query("", description="Date for historical mode (YYYY-MM-DD)"),
+    auto_atm: bool = Query(True, description="Auto-recalculate ATM per row from futures LTP"),
 ):
     """Minute-by-minute OI table data, dynamically aggregated by range."""
 
@@ -140,7 +153,7 @@ async def get_oi_table(
 
     buf = _engine_state.get("data_buffer")
     if not buf:
-        return {"rows": []}
+        return {"rows": [], "range_display": ""}
 
     oi_table_raw = list(buf["oi_table"])  # newest-first (appendleft)
     oi_strikes = list(buf["oi_strikes"])
@@ -174,15 +187,43 @@ async def get_oi_table(
     prev_pe_ce_diff = 0
     prev_price = 0
     prev_total_oi = 0
+    # Track previous RANGED OI for accurate minute-to-minute change
+    prev_ranged_pe_oi = 0
+    prev_ranged_ce_oi = 0
+
+    strike_interval = config.INDICES.get("NIFTY", {}).get("strike_interval", 50)
+    latest_range_display = ""
+
+    # BOTH modes use a SINGLE ATM for ALL rows (matches StockMojo exactly):
+    # - Auto ATM: ATM = latest live price rounded to nearest strike. Updates each refresh.
+    # - Fixed: ATM = locked at a specific value (client passes it, or falls back to latest).
+    # StockMojo NEVER uses per-row ATM — all rows always share the same range window.
+    computed_atm = 0
+    if chrono:
+        latest_row = chrono[-1]  # newest row (chrono is oldest→newest)
+        latest_price = latest_row.get("future_ltp", 0) or latest_row.get("underlying", 0)
+        computed_atm = round(latest_price / strike_interval) * strike_interval if latest_price > 0 else latest_row.get("atm_strike", 0)
 
     for r in chrono:
         ts = r["timestamp"]  # "HH:MM"
-        atm = r.get("atm_strike", 0)
 
-        # Recompute from per-strike data using range filter
+        # Single ATM for all rows (matches StockMojo for both Auto & Fixed modes)
+        atm = computed_atm if computed_atm > 0 else r.get("atm_strike", 0)
+
+        # Compute range display from ATM
+        if range_strikes == 0:
+            latest_range_display = "(All Strikes)"
+        elif atm > 0:
+            low_strike = atm - (range_strikes * strike_interval)
+            high_strike = atm + (range_strikes * strike_interval)
+            latest_range_display = f"({int(low_strike)} - {int(high_strike)})"
+
+        # Recompute from per-strike data using range filter + auto ATM
+        # range_strikes=0 means 'All' — use very large range to include everything
         strike_data = strike_by_ts.get(ts)
+        effective_range = range_strikes if range_strikes > 0 else 9999
         if strike_data and atm > 0:
-            ranged = _compute_ranged_snapshot(strike_data, atm, range_strikes)
+            ranged = _compute_ranged_snapshot(strike_data, atm, effective_range)
         else:
             ranged = None
 
@@ -201,37 +242,51 @@ async def get_oi_table(
             pe_ce_diff = r["pe_ce_diff"]
             pcr = r["pcr"]
 
-        pe_oi_change = r.get("pe_oi_change", 0)
-        ce_oi_change = r.get("ce_oi_change", 0)
+        # Minute-to-minute change: computed from RANGED OI (not raw totals)
+        pe_oi_change = total_pe_oi - prev_ranged_pe_oi if prev_ranged_pe_oi > 0 else 0
+        ce_oi_change = total_ce_oi - prev_ranged_ce_oi if prev_ranged_ce_oi > 0 else 0
         pe_ce_diff_change = pe_ce_diff - prev_pe_ce_diff if prev_pe_ce_diff != 0 else 0
         pe_ce_chg_day = pe_chg_oi_day - ce_chg_oi_day
+
+        # Total OI = FUTURES OI (StockMojo shows futures OI here, not option sum)
+        total_oi = r.get("futures_oi", 0)
 
         # Delta change: current minus previous (chronological order ensures correct sign)
         ce_delta_chg = round(r["atm_ce_ltp"] - prev_ce_ltp, 2) if prev_ce_ltp > 0 else 0
         pe_delta_chg = round(r["atm_pe_ltp"] - prev_pe_ltp, 2) if prev_pe_ltp > 0 else 0
 
-        # Signal: use pre-computed from snapshot, or compute from price+OI
+        # Signal: use pre-computed, or compute from price + OI direction
         signal = r.get("signal", "")
+        option_oi = total_ce_oi + total_pe_oi
         if not signal:
-            cur_price = r.get("underlying", r.get("future_ltp", 0))
-            cur_total_oi = (raw.get("total_pe_oi", 0) or 0) + (raw.get("total_ce_oi", 0) or 0)
+            cur_price = r.get("future_ltp", r.get("underlying", 0))
             if prev_price > 0 and prev_total_oi > 0:
-                price_up = cur_price > prev_price
-                oi_up = cur_total_oi > prev_total_oi
-                if price_up and oi_up:
-                    signal = "LB"
-                elif not price_up and oi_up:
-                    signal = "SB"
-                elif price_up and not oi_up:
-                    signal = "SC"
-                elif not price_up and not oi_up:
-                    signal = "LU"
+                price_changed = abs(cur_price - prev_price) > 0.01
+                oi_changed = option_oi != prev_total_oi
+                if not price_changed or not oi_changed:
+                    signal = "N/A"
                 else:
-                    signal = "S"
+                    price_up = cur_price > prev_price
+                    oi_up = option_oi > prev_total_oi
+                    if price_up and oi_up:
+                        signal = "LB"
+                    elif not price_up and oi_up:
+                        signal = "SB"
+                    elif price_up and not oi_up:
+                        signal = "SC"
+                    else:
+                        signal = "LU"
             else:
-                signal = "S"
-            prev_price = cur_price
-            prev_total_oi = cur_total_oi
+                signal = "N/A"
+
+        # Signal arrow prefix (matches StockMojo: ↑SC, ↓LU, ⇔N/A)
+        sig_arrow = ""
+        if signal in ("LB", "SC"):
+            sig_arrow = "↑"
+        elif signal in ("SB", "LU"):
+            sig_arrow = "↓"
+        elif signal == "N/A":
+            sig_arrow = "⇔"
 
         formatted.append({
             "time": ts,
@@ -247,10 +302,12 @@ async def get_oi_table(
             "pcr": pcr,
             "future_ltp": round(r["future_ltp"], 2),
             "straddle": r["straddle"],
-            "atm_strike": r["atm_strike"],
+            "atm_strike": atm,
+            "total_oi": _fmt_lakh(total_oi),
             "ce_delta_chg": ce_delta_chg,
             "pe_delta_chg": pe_delta_chg,
             "signal": signal,
+            "signal_arrow": sig_arrow,
             "_raw": {
                 **r,
                 "total_pe_oi": total_pe_oi,
@@ -260,16 +317,23 @@ async def get_oi_table(
                 "pe_oi_change_day": pe_chg_oi_day,
                 "ce_oi_change_day": ce_chg_oi_day,
                 "pe_ce_diff_change": pe_ce_diff_change,
+                "pe_oi_change": pe_oi_change,
+                "ce_oi_change": ce_oi_change,
+                "total_oi": total_oi,
             },
         })
         prev_ce_ltp = r["atm_ce_ltp"]
         prev_pe_ltp = r["atm_pe_ltp"]
         prev_pe_ce_diff = pe_ce_diff
+        prev_price = r.get("future_ltp", r.get("underlying", 0))
+        prev_total_oi = option_oi  # Track option OI for signal comparison
+        prev_ranged_pe_oi = total_pe_oi
+        prev_ranged_ce_oi = total_ce_oi
 
     # Reverse back to newest-first for UI display (latest at top)
     formatted.reverse()
 
-    return _sanitize({"rows": formatted})
+    return _sanitize({"rows": formatted, "range_display": latest_range_display})
 
 
 @router.get("/oi-chart")
@@ -307,9 +371,18 @@ async def get_oi_chart(
     underlying_vals = []
     straddle_vals = []
 
+    si = config.INDICES.get("NIFTY", {}).get("strike_interval", 50)
+
+    # Single ATM for all rows (same behavior as OI table endpoint)
+    computed_atm = 0
+    if oi_table:
+        latest = oi_table[-1]  # newest in chronological order
+        lp = latest.get("future_ltp", 0) or latest.get("underlying", 0)
+        computed_atm = round(lp / si) * si if lp > 0 else latest.get("atm_strike", 0)
+
     for r in oi_table:
         ts = r["timestamp"]
-        atm = r.get("atm_strike", 0)
+        atm = computed_atm if computed_atm > 0 else r.get("atm_strike", 0)
         strike_data = strike_by_ts.get(ts)
 
         if strike_data and atm > 0:

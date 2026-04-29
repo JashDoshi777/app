@@ -123,9 +123,10 @@ class MarketDataService:
         self._prev_day_oi_loaded = False  # Whether prev day OI was loaded
         self._day_open_oi = {}  # Fallback: first-seen OI if no DB data
         self._day_open_date = None  # Reset tracking on new day
-        # Futures LTP
+        # Futures LTP + OI
         self._futures_token = None  # Angel One token for NIFTY FUT
         self._futures_ltp = 0.0
+        self._futures_oi = 0  # Futures OI for 'Total OI' column (StockMojo)
         # Store credentials for re-authentication
         self._angel_credentials = {}
         self._last_reauth_attempt = 0  # Prevent rapid re-auth loops
@@ -335,25 +336,29 @@ class MarketDataService:
         """
         Get NIFTY Futures LTP.
         Priority: WebSocket cache -> REST API call -> spot price fallback.
+        Also captures Futures OI for the 'Total OI' column (matches StockMojo).
         """
         # Check WebSocket cache first
         with self._lock:
             if self._futures_ltp > 0:
                 return self._futures_ltp
 
-        # Try REST API call
+        # Try REST API call — use FULL mode to get OI as well
         if self._smart_api and self._futures_token:
             try:
                 result = self._smart_api.getMarketData(
-                    mode="LTP",
+                    mode="FULL",
                     exchangeTokens={"NFO": [self._futures_token]}
                 )
                 if result and result.get("data") and result["data"].get("fetched"):
                     item = result["data"]["fetched"][0]
                     ltp = float(item.get("ltp", 0))
+                    oi = int(item.get("opnInterest", 0))
                     if ltp > 0:
                         with self._lock:
                             self._futures_ltp = ltp
+                            if oi > 0:
+                                self._futures_oi = oi
                         return ltp
                 else:
                     # Check for token expiry — auto re-authenticate
@@ -364,20 +369,29 @@ class MarketDataService:
                             logger.warning("[TOKEN EXPIRED] Futures LTP — attempting re-auth")
                             if self._reauth_smartapi():
                                 retry = self._smart_api.getMarketData(
-                                    mode="LTP",
+                                    mode="FULL",
                                     exchangeTokens={"NFO": [self._futures_token]}
                                 )
                                 if retry and retry.get("data") and retry["data"].get("fetched"):
-                                    ltp = float(retry["data"]["fetched"][0].get("ltp", 0))
+                                    item = retry["data"]["fetched"][0]
+                                    ltp = float(item.get("ltp", 0))
+                                    oi = int(item.get("opnInterest", 0))
                                     if ltp > 0:
                                         with self._lock:
                                             self._futures_ltp = ltp
+                                            if oi > 0:
+                                                self._futures_oi = oi
                                         return ltp
             except Exception as e:
                 logger.debug("Futures LTP REST failed: %s", e)
 
         # Fallback to spot
         return self.get_ltp(symbol) or 0
+
+    def get_futures_oi(self, symbol: str = "NIFTY") -> int:
+        """Get NIFTY Futures OI (for 'Total OI' column matching StockMojo)."""
+        with self._lock:
+            return self._futures_oi
 
     def load_prev_day_oi_from_db(self, db_url: str):
         """
@@ -518,11 +532,14 @@ class MarketDataService:
         nearest_expiry = future_expiries["expiry_dt"].min()
         current = opts[opts["expiry_dt"] == nearest_expiry]
 
-        # Filter strikes near ATM (+-500 points for NIFTY)
+        # Filter strikes near ATM — use wide range (±1000 points)
+        # to ensure enough data for any user-selected range filter (up to ±20)
         si = config.INDICES.get(symbol, {}).get("strike_interval", 50)
         if underlying_price > 0:
-            atm = round(underlying_price / si) * si
-            current = current[abs(current["strike_num"] - atm) <= si * 10]
+            # Use futures LTP for ATM if available (matches StockMojo)
+            fut_ltp = self._futures_ltp if self._futures_ltp > 0 else underlying_price
+            atm = round(fut_ltp / si) * si
+            current = current[abs(current["strike_num"] - atm) <= si * 20]
 
         return current
 
@@ -539,12 +556,17 @@ class MarketDataService:
         if underlying <= 0:
             return pd.DataFrame()
 
-        option_contracts = self._get_option_tokens(symbol, underlying)
+        # Use futures LTP for ATM calculation (matches StockMojo)
+        fut_ltp = self._futures_ltp if self._futures_ltp > 0 else underlying
+        if fut_ltp <= 0:
+            return pd.DataFrame()
+
+        option_contracts = self._get_option_tokens(symbol, fut_ltp)
         if option_contracts is None or len(option_contracts) == 0:
             return pd.DataFrame()
 
         si = config.INDICES.get(symbol, {}).get("strike_interval", 50)
-        atm = round(underlying / si) * si
+        atm = round(fut_ltp / si) * si
 
         # Build token list and mapping: token -> (strike, CE/PE)
         token_map = {}
@@ -904,6 +926,46 @@ class MarketDataService:
             nearest = df["expiry"].iloc[0]
             df = df[df["expiry"] == nearest]
         return df
+
+    # ═══════════════════════════════════════════════════════
+    #  EXPIRY INFO (for dashboard badge)
+    # ═══════════════════════════════════════════════════════
+
+    def get_nearest_expiry_info(self, symbol: str = "NIFTY") -> dict:
+        """
+        Get nearest expiry date and days-to-expiry for the dashboard badge.
+        Returns: {"expiry": "05 May", "dte": 5, "label": "5 May (5d)", "expiry_date": "05MAY2026"}
+        """
+        if self._instrument_df is None or self._instrument_df.empty:
+            return {"expiry": "--", "dte": 0, "label": "--", "expiry_date": ""}
+
+        try:
+            df = self._instrument_df
+            opts = df[(df["exch_seg"] == "NFO") & (df["name"] == symbol.upper()) &
+                      (df["instrumenttype"] == "OPTIDX")].copy()
+            if opts.empty:
+                return {"expiry": "--", "dte": 0, "label": "--", "expiry_date": ""}
+
+            opts["expiry_dt"] = pd.to_datetime(opts["expiry"], format="%d%b%Y", errors="coerce")
+            future_expiries = opts[opts["expiry_dt"] >= datetime.now(IST).replace(tzinfo=None)]
+            if future_expiries.empty:
+                return {"expiry": "--", "dte": 0, "label": "--", "expiry_date": ""}
+
+            nearest_dt = future_expiries["expiry_dt"].min()
+            dte = max((nearest_dt - datetime.now(IST).replace(tzinfo=None)).days, 0)
+            expiry_str = nearest_dt.strftime("%d %b")
+            raw_expiry = nearest_dt.strftime("%d%b%Y").upper()
+            label = f"{nearest_dt.strftime('%-d %b')} ({dte}d)" if hasattr(nearest_dt, 'strftime') else f"{expiry_str} ({dte}d)"
+
+            return {
+                "expiry": expiry_str,
+                "dte": dte,
+                "label": f"{expiry_str.strip()} ({dte}d)",
+                "expiry_date": raw_expiry,
+            }
+        except Exception as e:
+            logger.debug("Expiry info failed: %s", e)
+            return {"expiry": "--", "dte": 0, "label": "--", "expiry_date": ""}
 
     # ═══════════════════════════════════════════════════════
     #  MOCK DATA (when no API available)

@@ -6,7 +6,7 @@
     <title>NIFTY OI Tracker — Live</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css?v=7">
+    <link rel="stylesheet" href="/static/css/style.css?v=8">
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
         body{font-family:'Inter',sans-serif;background:#0c0e14;color:#e8eaed;min-height:100vh;font-size:13px}
@@ -91,54 +91,46 @@
             <span class="table-label">NIFTY Spot</span>
         </div>
         <div class="table-filters">
-            <label class="filter-label">Display
-                <select id="oi-display-mode">
-                    <option value="total">Total OI</option>
-                    <option value="change">OI Change (Day)</option>
-                </select>
-            </label>
-            <label class="filter-label">Range
+            <!-- Auto ATM / Fixed toggle (matches StockMojo) -->
+            <div class="atm-mode-toggle">
+                <span class="filter-label-text">Mode</span>
+                <div class="tf-group" id="atm-mode-group">
+                    <button class="atm-btn active" data-atm-mode="auto">Auto ATM</button>
+                    <button class="atm-btn" data-atm-mode="fixed">Fixed</button>
+                </div>
+            </div>
+            <!-- Range selector with display -->
+            <label class="filter-label">± Range
                 <select id="strike-range">
-                    <option value="5">5</option>
-                    <option value="10" selected>10</option>
+                    <option value="0">All</option>
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4">4</option>
+                    <option value="5" selected>5</option>
+                    <option value="6">6</option>
+                    <option value="7">7</option>
+                    <option value="10">10</option>
                     <option value="15">15</option>
                     <option value="20">20</option>
                 </select>
             </label>
+            <span class="range-display" id="range-display">--</span>
+            <!-- Display mode buttons (matches StockMojo) -->
+            <div class="display-mode-toggle" id="display-mode-group">
+                <button class="display-btn active" data-display="total">Total OI</button>
+                <button class="display-btn" data-display="change">OI Change (Day)</button>
+                <button class="display-btn" data-display="all">All</button>
+            </div>
         </div>
     </div>
     <div class="table-container">
         <table class="oi-table" id="oi-data-table">
-            <thead>
-                <tr>
-                    <th rowspan="2" class="col-time">Time</th>
-                    <th colspan="3" class="col-group put-header">Put OI</th>
-                    <th colspan="3" class="col-group call-header">Call OI</th>
-                    <th colspan="3" class="col-group diff-header">PE - CE OI</th>
-                    <th rowspan="2" class="col-pcr">PCR</th>
-                    <th colspan="3" class="col-group future-header">Future</th>
-                    <th colspan="2" class="col-group" style="color:#26c6da">Delta Chg</th>
-                    <th rowspan="2" class="col-sentiment">Signal</th>
-                </tr>
-                <tr>
-                    <th class="sub">Total</th>
-                    <th class="sub">Chg (Day)</th>
-                    <th class="sub">Change</th>
-                    <th class="sub">Total</th>
-                    <th class="sub">Chg (Day)</th>
-                    <th class="sub">Change</th>
-                    <th class="sub">Total</th>
-                    <th class="sub">Chg (Day)</th>
-                    <th class="sub">Change</th>
-                    <th class="sub">LTP</th>
-                    <th class="sub">Straddle</th>
-                    <th class="sub">ATM</th>
-                    <th class="sub">CE</th>
-                    <th class="sub">PE</th>
-                </tr>
+            <thead id="oi-table-head">
+                <!-- Table header is dynamically rendered by JS based on display mode -->
             </thead>
             <tbody id="oi-table-body">
-                <tr><td colspan="17" class="empty-msg">Waiting for market data...</td></tr>
+                <tr><td colspan="14" class="empty-msg">Waiting for market data...</td></tr>
             </tbody>
         </table>
     </div>
@@ -196,6 +188,6 @@
     </div>
 </section>
 
-<script src="/static/js/app.js?v=7"></script>
+<script src="/static/js/app.js?v=8"></script>
 </body>
 </html>
