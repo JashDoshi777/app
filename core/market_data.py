@@ -335,15 +335,13 @@ class MarketDataService:
     def get_futures_ltp(self, symbol: str = "NIFTY") -> float:
         """
         Get NIFTY Futures LTP.
-        Priority: WebSocket cache -> REST API call -> spot price fallback.
-        Also captures Futures OI for the 'Total OI' column (matches StockMojo).
+        ALWAYS tries REST API FULL mode first to get both LTP + OI.
+        Falls back to WebSocket cache, then spot price.
+        
+        The WebSocket runs in LTP-only mode (mode 1), so it never provides OI.
+        We MUST hit REST FULL mode every iteration to populate futures_oi.
         """
-        # Check WebSocket cache first
-        with self._lock:
-            if self._futures_ltp > 0:
-                return self._futures_ltp
-
-        # Try REST API call — use FULL mode to get OI as well
+        # Try REST API call FIRST — FULL mode gives both LTP and OI
         if self._smart_api and self._futures_token:
             try:
                 result = self._smart_api.getMarketData(
@@ -385,13 +383,42 @@ class MarketDataService:
             except Exception as e:
                 logger.debug("Futures LTP REST failed: %s", e)
 
-        # Fallback to spot
+        # Fallback: WebSocket cached value (updated by tick handler)
+        with self._lock:
+            if self._futures_ltp > 0:
+                return self._futures_ltp
+
+        # Final fallback: spot price
         return self.get_ltp(symbol) or 0
 
     def get_futures_oi(self, symbol: str = "NIFTY") -> int:
-        """Get NIFTY Futures OI (for 'Total OI' column matching StockMojo)."""
+        """Get NIFTY Futures OI (for 'Total OI' column matching StockMojo).
+        If cached value is 0, actively attempt a REST FULL mode call to get it."""
         with self._lock:
-            return self._futures_oi
+            if self._futures_oi > 0:
+                return self._futures_oi
+
+        # OI not cached — try REST API directly
+        if self._smart_api and self._futures_token:
+            try:
+                result = self._smart_api.getMarketData(
+                    mode="FULL",
+                    exchangeTokens={"NFO": [self._futures_token]}
+                )
+                if result and result.get("data") and result["data"].get("fetched"):
+                    item = result["data"]["fetched"][0]
+                    oi = int(item.get("opnInterest", 0))
+                    ltp = float(item.get("ltp", 0))
+                    with self._lock:
+                        if oi > 0:
+                            self._futures_oi = oi
+                        if ltp > 0:
+                            self._futures_ltp = ltp
+                    return oi
+            except Exception as e:
+                logger.debug("Futures OI REST fetch failed: %s", e)
+
+        return 0
 
     def load_prev_day_oi_from_db(self, db_url: str):
         """

@@ -325,19 +325,20 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
 
     try:
         # Insert market snapshot
+        futures_oi = snapshot.get("futures_oi", 0)
         cur.execute("""
             INSERT INTO market_snapshots
             (timestamp, symbol, underlying_price, open, high, low, close, volume,
              total_ce_oi, total_pe_oi, total_ce_volume, total_pe_volume,
              pe_ce_oi_diff, pe_ce_oi_diff_change, pcr,
-             future_ltp, future_oi_change, atm_strike, atm_ce_ltp, atm_pe_ltp, straddle_price)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             future_ltp, future_oi_change, atm_strike, atm_ce_ltp, atm_pe_ltp, straddle_price, futures_oi)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             timestamp, "NIFTY", underlying, underlying, underlying, underlying, underlying,
             total_ce_vol + total_pe_vol,
             total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol,
             pe_ce_diff, pe_ce_diff_change, pcr,
-            future_ltp, 0, atm, atm_ce_ltp, atm_pe_ltp, straddle
+            future_ltp, 0, atm, atm_ce_ltp, atm_pe_ltp, straddle, futures_oi
         ))
 
         # Insert per-strike snapshots
@@ -403,7 +404,8 @@ def init_database_sync():
                 pcr FLOAT DEFAULT 0,
                 future_ltp FLOAT DEFAULT 0, future_oi_change BIGINT DEFAULT 0,
                 atm_strike FLOAT DEFAULT 0, atm_ce_ltp FLOAT DEFAULT 0,
-                atm_pe_ltp FLOAT DEFAULT 0, straddle_price FLOAT DEFAULT 0
+                atm_pe_ltp FLOAT DEFAULT 0, straddle_price FLOAT DEFAULT 0,
+                futures_oi BIGINT DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS ix_mkt_ts ON market_snapshots(timestamp);
             CREATE INDEX IF NOT EXISTS ix_mkt_sym_ts ON market_snapshots(symbol, timestamp);
@@ -435,6 +437,15 @@ def init_database_sync():
         """)
 
         conn.commit()
+
+        # Migration: add futures_oi column if it doesn't exist (for existing DBs)
+        try:
+            cur2 = conn.cursor()
+            cur2.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS futures_oi BIGINT DEFAULT 0;")
+            conn.commit()
+            cur2.close()
+        except Exception:
+            conn.rollback()  # Column might already exist
         cur.close()
         conn.close()
         logger.info("[OK] Database tables ready.")

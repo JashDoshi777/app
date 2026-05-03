@@ -107,6 +107,115 @@ def _compute_ranged_snapshot(strike_snap, atm_strike, range_strikes, strike_inte
     }
 
 
+def _filter_by_timeframe(rows, tf):
+    """
+    Filter rows to proper time-window boundaries aligned to market schedule.
+    For tf=15: returns rows at 9:30, 9:45, 10:00, 10:15, ...
+    For tf=5:  returns rows at 9:15, 9:20, 9:25, 9:30, ...
+    For tf=30: returns rows at 9:30, 10:00, 10:30, 11:00, ...
+
+    Takes a chronological list (oldest→newest). For each time window,
+    picks the LAST row in that window (most complete data).
+    Returns label time as the window boundary (e.g., 9:30 for 9:30-9:44 window).
+    """
+    if tf <= 1 or len(rows) <= 1:
+        return rows
+
+    # Market opens at 9:15 — all windows are aligned relative to this
+    MARKET_OPEN_MINUTES = 9 * 60 + 15  # 555
+
+    def _parse_hhmm(ts_str):
+        """Parse HH:MM to minutes since midnight."""
+        try:
+            parts = ts_str.split(":")
+            return int(parts[0]) * 60 + int(parts[1])
+        except Exception:
+            return -1
+
+    def _format_hhmm(total_minutes):
+        """Format minutes since midnight to HH:MM."""
+        h = total_minutes // 60
+        m = total_minutes % 60
+        return f"{h:02d}:{m:02d}"
+
+    # Group rows into time windows
+    # Window start = MARKET_OPEN + N * tf
+    windows = {}  # window_start_minutes -> last row in that window
+    for r in rows:
+        ts = r.get("timestamp", "")
+        mins = _parse_hhmm(ts)
+        if mins < 0:
+            continue
+        # Calculate which window this row belongs to
+        offset = mins - MARKET_OPEN_MINUTES
+        if offset < 0:
+            offset = 0
+        window_idx = offset // tf
+        window_start = MARKET_OPEN_MINUTES + window_idx * tf
+        # Store last row per window (overwrite = keep latest in window)
+        windows[window_start] = r
+
+    # Sort by window start time and relabel timestamps to window START
+    # StockMojo labels windows as: 09:15, 09:30, 09:45 (start of each window)
+    result = []
+    for w_start in sorted(windows.keys()):
+        row = dict(windows[w_start])  # copy
+        row["timestamp"] = _format_hhmm(w_start)
+        result.append(row)
+
+    return result
+
+
+def _filter_by_timeframe_full(rows, tf):
+    """
+    Same as _filter_by_timeframe but works with rows that have
+    full ISO timestamp (timestamp_full field) or datetime objects.
+    Used for historical data.
+    """
+    if tf <= 1 or len(rows) <= 1:
+        return rows
+
+    MARKET_OPEN_MINUTES = 9 * 60 + 15
+
+    def _get_minutes(r):
+        ts = r.get("timestamp")
+        if ts is None:
+            return -1
+        if hasattr(ts, 'hour'):
+            return ts.hour * 60 + ts.minute
+        ts_str = str(ts)
+        if "T" in ts_str:
+            time_part = ts_str.split("T")[1][:5]
+        else:
+            time_part = ts_str[:5]
+        try:
+            parts = time_part.split(":")
+            return int(parts[0]) * 60 + int(parts[1])
+        except Exception:
+            return -1
+
+    def _format_hhmm(total_minutes):
+        h = total_minutes // 60
+        m = total_minutes % 60
+        return f"{h:02d}:{m:02d}"
+
+    windows = {}
+    for r in rows:
+        mins = _get_minutes(r)
+        if mins < 0:
+            continue
+        offset = max(0, mins - MARKET_OPEN_MINUTES)
+        window_idx = offset // tf
+        window_start = MARKET_OPEN_MINUTES + window_idx * tf
+        windows[window_start] = r
+
+    result = []
+    for w_start in sorted(windows.keys()):
+        result.append(windows[w_start])
+
+    return result
+
+
 @router.get("/market-status")
 async def market_status():
     now = datetime.now(IST)
@@ -139,7 +248,7 @@ async def expiry_info():
 
 @router.get("/oi-table")
 async def get_oi_table(
-    tf: int = Query(1, description="Timeframe in minutes (1,3,5,15,60)"),
+    tf: int = Query(1, description="Timeframe in minutes (1,3,5,15,30)"),
     range_strikes: int = Query(10, description="Number of strikes from ATM each side"),
     mode: str = Query("live", description="live or historical"),
     date: str = Query("", description="Date for historical mode (YYYY-MM-DD)"),
@@ -158,59 +267,51 @@ async def get_oi_table(
     oi_table_raw = list(buf["oi_table"])  # newest-first (appendleft)
     oi_strikes = list(buf["oi_strikes"])
 
-    # Match timestamps between oi_table and oi_strikes
-    strike_by_ts = {}
+    # Build strike lookup using FULL ISO timestamp (not HH:MM) to avoid collisions
+    # when multiple snapshots happen in the same minute
+    strike_by_full_ts = {}
+    strike_by_hhmm = {}  # fallback lookup
     for snap in oi_strikes:
         ts_key = snap["timestamp"]
+        strike_by_full_ts[ts_key] = snap["strikes"]
         try:
             parsed = datetime.fromisoformat(ts_key)
             hhmm = parsed.strftime("%H:%M")
         except Exception:
             hhmm = ts_key
-        strike_by_ts[hhmm] = snap["strikes"]
+        strike_by_hhmm[hhmm] = snap["strikes"]
 
-    # Timeframe aggregation: sample every N minutes (on newest-first list)
-    if tf > 1 and len(oi_table_raw) > 1:
-        sampled = []
-        for i in range(0, len(oi_table_raw), tf):
-            sampled.append(oi_table_raw[i])
-        oi_table_raw = sampled
-
-    # CRITICAL: Reverse to chronological order (oldest→newest)
-    # so delta changes are computed correctly: current - previous
+    # STEP 1: Reverse to chronological order (oldest→newest)
     chrono = list(reversed(oi_table_raw))
 
-    # Compute all values in chronological order
-    formatted = []
-    prev_ce_ltp = 0
-    prev_pe_ltp = 0
-    prev_pe_ce_diff = 0
-    prev_price = 0
-    prev_total_oi = 0
-    # Track previous RANGED OI for accurate minute-to-minute change
-    prev_ranged_pe_oi = 0
-    prev_ranged_ce_oi = 0
+    # STEP 2: Apply proper time-window filtering BEFORE computing deltas
+    # This ensures 15m filter shows 9:30, 9:45, 10:00, etc.
+    if tf > 1:
+        chrono = _filter_by_timeframe(chrono, tf)
 
     strike_interval = config.INDICES.get("NIFTY", {}).get("strike_interval", 50)
     latest_range_display = ""
 
-    # BOTH modes use a SINGLE ATM for ALL rows (matches StockMojo exactly):
-    # - Auto ATM: ATM = latest live price rounded to nearest strike. Updates each refresh.
-    # - Fixed: ATM = locked at a specific value (client passes it, or falls back to latest).
-    # StockMojo NEVER uses per-row ATM — all rows always share the same range window.
+    # ATM computation: Auto vs Fixed mode (matches StockMojo toggle)
+    # Auto ATM: compute from LATEST futures price, apply to ALL rows
+    # Fixed: each row uses its own recorded ATM from capture time
     computed_atm = 0
-    if chrono:
-        latest_row = chrono[-1]  # newest row (chrono is oldest→newest)
+    if auto_atm and chrono:
+        latest_row = chrono[-1]
         latest_price = latest_row.get("future_ltp", 0) or latest_row.get("underlying", 0)
         computed_atm = round(latest_price / strike_interval) * strike_interval if latest_price > 0 else latest_row.get("atm_strike", 0)
 
+    # STEP 3: First pass — compute ranged OI totals for each row
+    enriched = []
     for r in chrono:
         ts = r["timestamp"]  # "HH:MM"
+        if auto_atm:
+            atm = computed_atm if computed_atm > 0 else r.get("atm_strike", 0)
+        else:
+            # Fixed mode: use each row's own ATM (recalculated from its own futures LTP)
+            row_price = r.get("future_ltp", 0) or r.get("underlying", 0)
+            atm = round(row_price / strike_interval) * strike_interval if row_price > 0 else r.get("atm_strike", 0)
 
-        # Single ATM for all rows (matches StockMojo for both Auto & Fixed modes)
-        atm = computed_atm if computed_atm > 0 else r.get("atm_strike", 0)
-
-        # Compute range display from ATM
         if range_strikes == 0:
             latest_range_display = "(All Strikes)"
         elif atm > 0:
@@ -218,12 +319,15 @@ async def get_oi_table(
             high_strike = atm + (range_strikes * strike_interval)
             latest_range_display = f"({int(low_strike)} - {int(high_strike)})"
 
-        # Recompute from per-strike data using range filter + auto ATM
-        # range_strikes=0 means 'All' — use very large range to include everything
-        strike_data = strike_by_ts.get(ts)
+        # Look up strike data — try full ISO timestamp first, then HH:MM fallback
+        full_ts = r.get("timestamp_full", "")
+        strike_data = strike_by_full_ts.get(full_ts) if full_ts else None
+        if not strike_data:
+            strike_data = strike_by_hhmm.get(ts)
+
         effective_range = range_strikes if range_strikes > 0 else 9999
         if strike_data and atm > 0:
-            ranged = _compute_ranged_snapshot(strike_data, atm, effective_range)
+            ranged = _compute_ranged_snapshot(strike_data, atm, effective_range, strike_interval)
         else:
             ranged = None
 
@@ -242,44 +346,67 @@ async def get_oi_table(
             pe_ce_diff = r["pe_ce_diff"]
             pcr = r["pcr"]
 
-        # Minute-to-minute change: computed from RANGED OI (not raw totals)
-        pe_oi_change = total_pe_oi - prev_ranged_pe_oi if prev_ranged_pe_oi > 0 else 0
-        ce_oi_change = total_ce_oi - prev_ranged_ce_oi if prev_ranged_ce_oi > 0 else 0
-        pe_ce_diff_change = pe_ce_diff - prev_pe_ce_diff if prev_pe_ce_diff != 0 else 0
-        pe_ce_chg_day = pe_chg_oi_day - ce_chg_oi_day
+        # Extract ATM CE/PE LTP from per-strike data for the CURRENT ATM
+        # This ensures Delta Change uses the correct strike even if ATM shifted
+        atm_ce_ltp = r.get("atm_ce_ltp", 0)
+        atm_pe_ltp = r.get("atm_pe_ltp", 0)
+        if strike_data and atm > 0:
+            for s in strike_data:
+                if s["strike"] == atm:
+                    atm_ce_ltp = s.get("ce_ltp", atm_ce_ltp)
+                    atm_pe_ltp = s.get("pe_ltp", atm_pe_ltp)
+                    break
 
-        # Total OI = FUTURES OI (StockMojo shows futures OI here, not option sum)
+        enriched.append({
+            "row": r,
+            "total_pe_oi": total_pe_oi,
+            "total_ce_oi": total_ce_oi,
+            "pe_chg_oi_day": pe_chg_oi_day,
+            "ce_chg_oi_day": ce_chg_oi_day,
+            "pe_ce_diff": pe_ce_diff,
+            "pcr": pcr,
+            "atm": atm,
+            "atm_ce_ltp": atm_ce_ltp,
+            "atm_pe_ltp": atm_pe_ltp,
+        })
+
+    # STEP 4: Second pass — compute deltas between FILTERED rows (correct for any timeframe)
+    formatted = []
+    for idx, e in enumerate(enriched):
+        r = e["row"]
+        ts = r["timestamp"]
+        atm = e["atm"]
+        total_pe_oi = e["total_pe_oi"]
+        total_ce_oi = e["total_ce_oi"]
+        pe_chg_oi_day = e["pe_chg_oi_day"]
+        ce_chg_oi_day = e["ce_chg_oi_day"]
+        pe_ce_diff = e["pe_ce_diff"]
+        pcr = e["pcr"]
+
+        if idx > 0:
+            prev = enriched[idx - 1]
+            pe_oi_change = total_pe_oi - prev["total_pe_oi"]
+            ce_oi_change = total_ce_oi - prev["total_ce_oi"]
+            pe_ce_diff_change = pe_ce_diff - prev["pe_ce_diff"]
+            ce_delta_chg = round(e["atm_ce_ltp"] - prev["atm_ce_ltp"], 2)
+            pe_delta_chg = round(e["atm_pe_ltp"] - prev["atm_pe_ltp"], 2)
+            # Signal: computed from futures LTP + ranged total OI direction
+            cur_price = r.get("future_ltp", r.get("underlying", 0))
+            prev_price = prev["row"].get("future_ltp", prev["row"].get("underlying", 0))
+            cur_total_oi = total_ce_oi + total_pe_oi
+            prev_total_oi = prev["total_ce_oi"] + prev["total_pe_oi"]
+            signal = _compute_signal_from_data(cur_price, prev_price, cur_total_oi, prev_total_oi)
+        else:
+            pe_oi_change = 0
+            ce_oi_change = 0
+            pe_ce_diff_change = 0
+            ce_delta_chg = 0
+            pe_delta_chg = 0
+            signal = r.get("signal", "N/A")
+
+        pe_ce_chg_day = pe_chg_oi_day - ce_chg_oi_day
         total_oi = r.get("futures_oi", 0)
 
-        # Delta change: current minus previous (chronological order ensures correct sign)
-        ce_delta_chg = round(r["atm_ce_ltp"] - prev_ce_ltp, 2) if prev_ce_ltp > 0 else 0
-        pe_delta_chg = round(r["atm_pe_ltp"] - prev_pe_ltp, 2) if prev_pe_ltp > 0 else 0
-
-        # Signal: use pre-computed, or compute from price + OI direction
-        signal = r.get("signal", "")
-        option_oi = total_ce_oi + total_pe_oi
-        if not signal:
-            cur_price = r.get("future_ltp", r.get("underlying", 0))
-            if prev_price > 0 and prev_total_oi > 0:
-                price_changed = abs(cur_price - prev_price) > 0.01
-                oi_changed = option_oi != prev_total_oi
-                if not price_changed or not oi_changed:
-                    signal = "N/A"
-                else:
-                    price_up = cur_price > prev_price
-                    oi_up = option_oi > prev_total_oi
-                    if price_up and oi_up:
-                        signal = "LB"
-                    elif not price_up and oi_up:
-                        signal = "SB"
-                    elif price_up and not oi_up:
-                        signal = "SC"
-                    else:
-                        signal = "LU"
-            else:
-                signal = "N/A"
-
-        # Signal arrow prefix (matches StockMojo: ↑SC, ↓LU, ⇔N/A)
         sig_arrow = ""
         if signal in ("LB", "SC"):
             sig_arrow = "↑"
@@ -300,10 +427,10 @@ async def get_oi_table(
             "pe_ce_change_day": _fmt_lakh(pe_ce_chg_day),
             "pe_ce_change": _fmt_lakh(pe_ce_diff_change),
             "pcr": pcr,
-            "future_ltp": round(r["future_ltp"], 2),
-            "straddle": r["straddle"],
+            "future_ltp": round(r.get("future_ltp", 0), 2),
+            "straddle": round(e["atm_ce_ltp"] + e["atm_pe_ltp"], 2),
             "atm_strike": atm,
-            "total_oi": _fmt_lakh(total_oi),
+            "total_oi": _fmt_lakh(total_oi) if total_oi else "--",
             "ce_delta_chg": ce_delta_chg,
             "pe_delta_chg": pe_delta_chg,
             "signal": signal,
@@ -322,18 +449,31 @@ async def get_oi_table(
                 "total_oi": total_oi,
             },
         })
-        prev_ce_ltp = r["atm_ce_ltp"]
-        prev_pe_ltp = r["atm_pe_ltp"]
-        prev_pe_ce_diff = pe_ce_diff
-        prev_price = r.get("future_ltp", r.get("underlying", 0))
-        prev_total_oi = option_oi  # Track option OI for signal comparison
-        prev_ranged_pe_oi = total_pe_oi
-        prev_ranged_ce_oi = total_ce_oi
 
-    # Reverse back to newest-first for UI display (latest at top)
+    # Reverse to newest-first for UI display
     formatted.reverse()
 
     return _sanitize({"rows": formatted, "range_display": latest_range_display})
+
+
+def _compute_signal_from_data(cur_price, prev_price, cur_total_oi, prev_total_oi):
+    """Compute LB/SB/SC/LU signal from price + OI direction between two snapshots."""
+    if prev_price <= 0 or prev_total_oi <= 0:
+        return "N/A"
+    price_changed = abs(cur_price - prev_price) > 0.01
+    oi_changed = cur_total_oi != prev_total_oi
+    if not price_changed or not oi_changed:
+        return "N/A"
+    price_up = cur_price > prev_price
+    oi_up = cur_total_oi > prev_total_oi
+    if price_up and oi_up:
+        return "LB"
+    elif not price_up and oi_up:
+        return "SB"
+    elif price_up and not oi_up:
+        return "SC"
+    else:
+        return "LU"
 
 
 @router.get("/oi-chart")
@@ -349,19 +489,22 @@ async def get_oi_chart(
     oi_table = list(reversed(list(buf["oi_table"])))  # Chronological
     oi_strikes = list(buf["oi_strikes"])
 
-    # Build strike lookup by HH:MM
-    strike_by_ts = {}
+    # Build strike lookups (full ISO + HH:MM fallback)
+    strike_by_full_ts = {}
+    strike_by_hhmm = {}
     for snap in oi_strikes:
+        ts_key = snap["timestamp"]
+        strike_by_full_ts[ts_key] = snap["strikes"]
         try:
-            parsed = datetime.fromisoformat(snap["timestamp"])
+            parsed = datetime.fromisoformat(ts_key)
             hhmm = parsed.strftime("%H:%M")
         except Exception:
-            hhmm = snap["timestamp"]
-        strike_by_ts[hhmm] = snap["strikes"]
+            hhmm = ts_key
+        strike_by_hhmm[hhmm] = snap["strikes"]
 
-    # Timeframe sampling
-    if tf > 1 and len(oi_table) > 1:
-        oi_table = oi_table[::tf]
+    # Apply proper timeframe filtering
+    if tf > 1:
+        oi_table = _filter_by_timeframe(oi_table, tf)
 
     timestamps = []
     put_oi = []
@@ -373,20 +516,25 @@ async def get_oi_chart(
 
     si = config.INDICES.get("NIFTY", {}).get("strike_interval", 50)
 
-    # Single ATM for all rows (same behavior as OI table endpoint)
     computed_atm = 0
     if oi_table:
-        latest = oi_table[-1]  # newest in chronological order
+        latest = oi_table[-1]
         lp = latest.get("future_ltp", 0) or latest.get("underlying", 0)
         computed_atm = round(lp / si) * si if lp > 0 else latest.get("atm_strike", 0)
 
     for r in oi_table:
         ts = r["timestamp"]
         atm = computed_atm if computed_atm > 0 else r.get("atm_strike", 0)
-        strike_data = strike_by_ts.get(ts)
 
+        # Dual lookup for strike data
+        full_ts = r.get("timestamp_full", "")
+        strike_data = strike_by_full_ts.get(full_ts) if full_ts else None
+        if not strike_data:
+            strike_data = strike_by_hhmm.get(ts)
+
+        effective_range = range_strikes if range_strikes > 0 else 9999
         if strike_data and atm > 0:
-            ranged = _compute_ranged_snapshot(strike_data, atm, range_strikes)
+            ranged = _compute_ranged_snapshot(strike_data, atm, effective_range, si)
         else:
             ranged = None
 
@@ -401,8 +549,15 @@ async def get_oi_chart(
             call_oi.append(r["total_ce_oi"])
             pe_ce.append(r["pe_ce_diff"])
             pcr_vals.append(r["pcr"])
-        underlying_vals.append(r["underlying"])
-        straddle_vals.append(r["straddle"])
+        underlying_vals.append(r.get("underlying", 0))
+        # Compute straddle from per-strike data for correct ATM
+        straddle_val = r.get("straddle", 0)
+        if strike_data and atm > 0:
+            for s in strike_data:
+                if s["strike"] == atm:
+                    straddle_val = round(s.get("ce_ltp", 0) + s.get("pe_ltp", 0), 2)
+                    break
+        straddle_vals.append(straddle_val)
 
     return _sanitize({
         "timestamps": timestamps,
@@ -504,7 +659,7 @@ async def get_strikes():
         return {"strikes": [], "atm": 0}
 
     underlying = buf.get("latest_underlying", 0)
-    si = 50  # NIFTY strike interval
+    si = config.INDICES.get("NIFTY", {}).get("strike_interval", 50)
     atm = round(underlying / si) * si
     strikes = sorted(chain["strike"].unique().tolist())
 
@@ -690,8 +845,9 @@ async def get_historical_chart(
                 atm = grp["atm"]
                 if atm <= 0:
                     continue
+                si_hist = config.INDICES.get("NIFTY", {}).get("strike_interval", 50)
                 filtered = [s for s in grp["strikes"]
-                            if abs(float(s["strike"]) - atm) <= range_strikes * 50]
+                            if abs(float(s["strike"]) - atm) <= range_strikes * si_hist]
                 if not filtered:
                     continue
                 tce = sum(int(s.get("ce_oi", 0) or 0) for s in filtered)
@@ -738,13 +894,29 @@ async def get_historical_chart(
         # Build OHLC candles
         candles = _build_candles(candle_buf, tf)
 
-        # TF sampling for lines
+        # TF sampling for lines — proper time-window alignment
         if tf > 1 and len(timestamps) > 1:
-            timestamps = timestamps[::tf]
-            put_oi_vals = put_oi_vals[::tf]
-            call_oi_vals = call_oi_vals[::tf]
-            pe_ce_vals = pe_ce_vals[::tf]
-            pcr_vals = pcr_vals[::tf]
+            MARKET_OPEN_MINUTES = 9 * 60 + 15
+            windows = {}  # w_start -> index
+            for i, ts_str in enumerate(timestamps):
+                try:
+                    parts = ts_str.split(":")
+                    mins = int(parts[0]) * 60 + int(parts[1])
+                except Exception:
+                    continue
+                offset = max(0, mins - MARKET_OPEN_MINUTES)
+                w_start = MARKET_OPEN_MINUTES + (offset // tf) * tf
+                windows[w_start] = i  # Keep last index per window
+            sorted_windows = sorted(windows.keys())
+            indices = [windows[w] for w in sorted_windows]
+            # Relabel timestamps to window START (matches StockMojo convention)
+            def _fmt_hhmm(m):
+                return f"{m // 60:02d}:{m % 60:02d}"
+            timestamps = [_fmt_hhmm(w) for w in sorted_windows]
+            put_oi_vals = [put_oi_vals[i] for i in indices]
+            call_oi_vals = [call_oi_vals[i] for i in indices]
+            pe_ce_vals = [pe_ce_vals[i] for i in indices]
+            pcr_vals = [pcr_vals[i] for i in indices]
 
         return _sanitize({
             "timestamps": timestamps,
@@ -812,6 +984,26 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
             conn.close()
             return {"rows": [], "date": date}
 
+        # Try to read futures_oi if column exists
+        try:
+            cur.execute("""
+                SELECT timestamp, futures_oi FROM market_snapshots
+                WHERE symbol = 'NIFTY'
+                  AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
+                ORDER BY timestamp ASC
+            """, (date,))
+            foi_map = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
+        except Exception:
+            conn.rollback()
+            foi_map = {}
+
+        si = config.INDICES.get("NIFTY", {}).get("strike_interval", 50)
+
+        # Auto ATM: compute from LATEST row's futures LTP (same as live mode)
+        latest = ms_rows[-1]
+        latest_fut = float(latest.get("future_ltp", 0) or 0) or float(latest.get("underlying_price", 0) or 0)
+        computed_atm = round(latest_fut / si) * si if latest_fut > 0 else float(latest.get("atm_strike", 0) or 0)
+
         # Check if per-strike data is available for range filtering
         cur.execute("""
             SELECT COUNT(*) FROM oi_snapshots
@@ -821,38 +1013,27 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         """, (date,))
         has_strikes = cur.fetchone()[0] > 0
 
-        # Build ranged OI lookup from oi_snapshots
-        ranged_by_ts = {}
+        # Build per-strike data lookup
+        ts_strike_groups = {}
         if has_strikes:
             cur.execute("""
-                SELECT timestamp, strike, ce_oi, pe_oi
+                SELECT timestamp, strike, ce_oi, pe_oi, ce_ltp, pe_ltp
                 FROM oi_snapshots
                 WHERE symbol = 'NIFTY'
                   AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
                 ORDER BY timestamp ASC, strike ASC
             """, (date,))
-            strike_cols = [desc[0] for desc in cur.description]
-            all_strike_rows = [dict(zip(strike_cols, row)) for row in cur.fetchall()]
-
-            from collections import OrderedDict
-            ts_strike_groups = OrderedDict()
-            for sr in all_strike_rows:
-                ts = sr["timestamp"]
+            for row in cur.fetchall():
+                ts = row[0]
                 if ts not in ts_strike_groups:
                     ts_strike_groups[ts] = []
-                ts_strike_groups[ts].append(sr)
-
-            # For each timestamp, compute ranged totals
-            for ms_row in ms_rows:
-                ts = ms_row["timestamp"]
-                atm = float(ms_row.get("atm_strike", 0) or 0)
-                strikes = ts_strike_groups.get(ts, [])
-                if strikes and atm > 0:
-                    filtered = [s for s in strikes
-                                if abs(float(s["strike"]) - atm) <= range_strikes * 50]
-                    tce = sum(int(s.get("ce_oi", 0) or 0) for s in filtered)
-                    tpe = sum(int(s.get("pe_oi", 0) or 0) for s in filtered)
-                    ranged_by_ts[ts] = {"ce": tce, "pe": tpe}
+                ts_strike_groups[ts].append({
+                    "strike": float(row[1]),
+                    "ce_oi": int(row[2] or 0),
+                    "pe_oi": int(row[3] or 0),
+                    "ce_ltp": float(row[4] or 0),
+                    "pe_ltp": float(row[5] or 0),
+                })
 
         cur.close()
         conn.close()
@@ -863,7 +1044,6 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         try:
             conn2 = psycopg2.connect(db_url)
             cur2 = conn2.cursor()
-            # Find the most recent trading day before the requested date
             cur2.execute("""
                 SELECT DISTINCT DATE(timestamp AT TIME ZONE 'Asia/Kolkata') as dt
                 FROM market_snapshots
@@ -875,7 +1055,6 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
             prev_row = cur2.fetchone()
             if prev_row:
                 prev_date = prev_row[0].strftime("%Y-%m-%d")
-                # Get the LAST snapshot from that previous day (closing values)
                 cur2.execute("""
                     SELECT total_ce_oi, total_pe_oi FROM market_snapshots
                     WHERE symbol = 'NIFTY'
@@ -887,7 +1066,6 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                 if close_row:
                     prev_day_ce_oi = int(close_row[0] or 0)
                     prev_day_pe_oi = int(close_row[1] or 0)
-                    logger.debug("Hist baseline from prev day %s: CE=%d, PE=%d", prev_date, prev_day_ce_oi, prev_day_pe_oi)
             cur2.close()
             conn2.close()
         except Exception as e:
@@ -895,24 +1073,12 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
 
         # Fallback: if no previous day data, use first row of current day
         if prev_day_ce_oi == 0 and prev_day_pe_oi == 0:
-            if ranged_by_ts:
-                first_ts = ms_rows[0]["timestamp"]
-                first_ranged = ranged_by_ts.get(first_ts)
-                prev_day_ce_oi = first_ranged["ce"] if first_ranged else int(ms_rows[0].get("total_ce_oi", 0) or 0)
-                prev_day_pe_oi = first_ranged["pe"] if first_ranged else int(ms_rows[0].get("total_pe_oi", 0) or 0)
-            else:
-                prev_day_ce_oi = int(ms_rows[0].get("total_ce_oi", 0) or 0)
-                prev_day_pe_oi = int(ms_rows[0].get("total_pe_oi", 0) or 0)
+            prev_day_ce_oi = int(ms_rows[0].get("total_ce_oi", 0) or 0)
+            prev_day_pe_oi = int(ms_rows[0].get("total_pe_oi", 0) or 0)
 
-        all_rows = []
-        prev_ce_oi = 0
-        prev_pe_oi = 0
-        prev_pe_ce_diff = 0
-        prev_ce_ltp = 0
-        prev_pe_ltp = 0
-        prev_price_hist = 0
-        prev_total_oi_hist = 0
-
+        # STEP 1: Build intermediate rows with ranged OI + ATM CE/PE LTP
+        intermediate = []
+        effective_range = range_strikes if range_strikes > 0 else 9999
         for r in ms_rows:
             ts = r["timestamp"]
             if hasattr(ts, 'astimezone'):
@@ -924,35 +1090,93 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
             else:
                 time_str = str(ts)
 
-            # Use ranged OI if available, otherwise raw totals
-            ranged = ranged_by_ts.get(ts)
-            if ranged:
-                total_pe = ranged["pe"]
-                total_ce = ranged["ce"]
+            atm = computed_atm  # Auto ATM: same for all rows
+
+            # Compute ranged OI from per-strike data
+            strikes = ts_strike_groups.get(ts, [])
+            if strikes and atm > 0:
+                filtered = [s for s in strikes if abs(s["strike"] - atm) <= effective_range * si]
+                total_ce = sum(s["ce_oi"] for s in filtered)
+                total_pe = sum(s["pe_oi"] for s in filtered)
+                # Extract ATM CE/PE LTP from per-strike data
+                atm_ce = float(r.get("atm_ce_ltp", 0) or 0)
+                atm_pe = float(r.get("atm_pe_ltp", 0) or 0)
+                for s in strikes:
+                    if s["strike"] == atm:
+                        atm_ce = s["ce_ltp"]
+                        atm_pe = s["pe_ltp"]
+                        break
             else:
                 total_pe = int(r.get("total_pe_oi", 0) or 0)
                 total_ce = int(r.get("total_ce_oi", 0) or 0)
+                atm_ce = float(r.get("atm_ce_ltp", 0) or 0)
+                atm_pe = float(r.get("atm_pe_ltp", 0) or 0)
 
+            intermediate.append({
+                "time_str": time_str,
+                "total_pe": total_pe,
+                "total_ce": total_ce,
+                "straddle": round(atm_ce + atm_pe, 2),
+                "future": float(r.get("future_ltp", 0) or 0),
+                "atm": atm,
+                "atm_ce": atm_ce,
+                "atm_pe": atm_pe,
+                "underlying": float(r.get("underlying_price", 0) or 0),
+                "futures_oi": foi_map.get(ts, 0),
+                "timestamp": time_str,  # needed for _filter_by_timeframe
+            })
+
+        # STEP 2: Apply proper time-window filtering BEFORE computing deltas
+        if tf > 1 and len(intermediate) > 1:
+            intermediate = _filter_by_timeframe(intermediate, tf)
+
+        # STEP 3: Compute deltas between FILTERED rows
+        all_rows = []
+        for idx, item in enumerate(intermediate):
+            total_pe = item["total_pe"]
+            total_ce = item["total_ce"]
             pe_ce_diff = total_pe - total_ce
             pcr_val = round(total_pe / max(total_ce, 1), 4)
-            straddle = float(r.get("straddle_price", 0) or 0)
-            future = float(r.get("future_ltp", 0) or 0)
-            atm = float(r.get("atm_strike", 0) or 0)
-            atm_ce = float(r.get("atm_ce_ltp", 0) or 0)
-            atm_pe = float(r.get("atm_pe_ltp", 0) or 0)
 
             pe_chg_day = total_pe - prev_day_pe_oi
             ce_chg_day = total_ce - prev_day_ce_oi
-            pe_chg_min = total_pe - prev_pe_oi if prev_pe_oi > 0 else 0
-            ce_chg_min = total_ce - prev_ce_oi if prev_ce_oi > 0 else 0
-            pe_ce_diff_chg = pe_ce_diff - prev_pe_ce_diff if prev_pe_ce_diff != 0 else 0
             pe_ce_chg_day = pe_chg_day - ce_chg_day
 
-            ce_delta_chg = round(atm_ce - prev_ce_ltp, 2) if prev_ce_ltp > 0 else 0
-            pe_delta_chg = round(atm_pe - prev_pe_ltp, 2) if prev_pe_ltp > 0 else 0
+            if idx > 0:
+                prev_item = intermediate[idx - 1]
+                pe_chg_min = total_pe - prev_item["total_pe"]
+                ce_chg_min = total_ce - prev_item["total_ce"]
+                prev_pe_ce = prev_item["total_pe"] - prev_item["total_ce"]
+                pe_ce_diff_chg = pe_ce_diff - prev_pe_ce
+                ce_delta_chg = round(item["atm_ce"] - prev_item["atm_ce"], 2)
+                pe_delta_chg = round(item["atm_pe"] - prev_item["atm_pe"], 2)
+                # Signal uses futures LTP (matches live endpoint)
+                cur_price = item["future"] if item["future"] > 0 else item["underlying"]
+                prev_price = prev_item["future"] if prev_item["future"] > 0 else prev_item["underlying"]
+                signal = _compute_signal_from_data(
+                    cur_price, prev_price,
+                    total_ce + total_pe, prev_item["total_ce"] + prev_item["total_pe"])
+            else:
+                pe_chg_min = 0
+                ce_chg_min = 0
+                pe_ce_diff_chg = 0
+                ce_delta_chg = 0
+                pe_delta_chg = 0
+                signal = "N/A"
+
+            # Signal arrow (matches live endpoint)
+            sig_arrow = ""
+            if signal in ("LB", "SC"):
+                sig_arrow = "↑"
+            elif signal in ("SB", "LU"):
+                sig_arrow = "↓"
+            elif signal == "N/A":
+                sig_arrow = "⇔"
+
+            total_oi = item.get("futures_oi", 0)
 
             all_rows.append({
-                "time": time_str,
+                "time": item["time_str"],
                 "pe_oi_total": _fmt_lakh(total_pe),
                 "pe_oi_change_day": _fmt_lakh(pe_chg_day),
                 "pe_oi_change": _fmt_lakh(pe_chg_min),
@@ -963,16 +1187,16 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                 "pe_ce_change_day": _fmt_lakh(pe_ce_chg_day),
                 "pe_ce_change": _fmt_lakh(pe_ce_diff_chg),
                 "pcr": pcr_val,
-                "future_ltp": round(future, 2),
-                "straddle": straddle,
-                "atm_strike": atm,
+                "future_ltp": round(item["future"], 2),
+                "straddle": item["straddle"],
+                "atm_strike": item["atm"],
+                "total_oi": _fmt_lakh(total_oi) if total_oi else "--",
                 "ce_delta_chg": ce_delta_chg,
                 "pe_delta_chg": pe_delta_chg,
-                "signal": _compute_hist_signal(
-                    float(r.get("underlying_price", 0) or 0), prev_price_hist,
-                    total_ce + total_pe, prev_total_oi_hist),
+                "signal": signal,
+                "signal_arrow": sig_arrow,
                 "_raw": {
-                    "underlying": float(r.get("underlying_price", 0) or 0),
+                    "underlying": item["underlying"],
                     "total_pe_oi": total_pe,
                     "total_ce_oi": total_ce,
                     "pe_ce_diff": pe_ce_diff,
@@ -982,19 +1206,9 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                     "ce_oi_change_day": ce_chg_day,
                     "pe_oi_change": pe_chg_min,
                     "ce_oi_change": ce_chg_min,
+                    "total_oi": total_oi,
                 },
             })
-            prev_price_hist = float(r.get("underlying_price", 0) or 0)
-            prev_ce_oi = total_ce
-            prev_pe_oi = total_pe
-            prev_pe_ce_diff = pe_ce_diff
-            prev_total_oi_hist = total_ce + total_pe
-            prev_ce_ltp = atm_ce
-            prev_pe_ltp = atm_pe
-
-        # Timeframe sampling (after computing changes)
-        if tf > 1 and len(all_rows) > 1:
-            all_rows = all_rows[::tf]
 
         # Reverse to newest-first for display
         all_rows.reverse()
@@ -1005,23 +1219,4 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         logger.error("Historical OI table failed: %s", e)
         return {"rows": [], "error": str(e)}
 
-
-def _compute_hist_signal(cur_price, prev_price, cur_total_oi, prev_total_oi):
-    """
-    Compute signal for historical data.
-    Matches StockMojo: LB/SB/SC/LU based on price direction + total OI direction.
-    """
-    if prev_price <= 0 or prev_total_oi <= 0:
-        return "S"
-    price_up = cur_price > prev_price
-    oi_up = cur_total_oi > prev_total_oi
-    if price_up and oi_up:
-        return "LB"
-    elif not price_up and oi_up:
-        return "SB"
-    elif price_up and not oi_up:
-        return "SC"
-    elif not price_up and not oi_up:
-        return "LU"
-    return "S"
 

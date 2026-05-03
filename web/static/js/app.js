@@ -158,31 +158,98 @@ async function loadOITable(){
         const raw0=data.rows[0]._raw;
         if(raw0)document.getElementById('underlying-price').textContent=raw0.underlying?.toFixed(2)||'--';
         const dm=currentDisplayMode;
+        const rows=data.rows;
+
+        // Pre-compute highlighting:
+        // 1) 2× OI change — compare absolute change to previous row's absolute change
+        // 2) 3-consecutive negative — track consecutive negative change in OI rows
+        const highlights2x=[];
+        const rowHighlights=[];
+
+        // Rows are newest-first in data. We process in display order (newest first).
+        // For consecutive checking, we need chronological order, so reverse temporarily.
+        const chronoRows=[...rows].reverse();
+
+        // Track consecutive negatives in chronological order
+        let ceNegStreak=0,peNegStreak=0;
+        const ceNegStreakArr=[];
+        const peNegStreakArr=[];
+
+        for(let i=0;i<chronoRows.length;i++){
+            const raw=chronoRows[i]._raw||{};
+            const ceChg=raw.ce_oi_change||0;
+            const peChg=raw.pe_oi_change||0;
+
+            // Track consecutive negatives
+            if(ceChg<0){ceNegStreak++;} else {ceNegStreak=0;}
+            if(peChg<0){peNegStreak++;} else {peNegStreak=0;}
+            ceNegStreakArr.push(ceNegStreak);
+            peNegStreakArr.push(peNegStreak);
+        }
+
+        // Map back to display order (newest-first)
+        const ceStreaks=[...ceNegStreakArr].reverse();
+        const peStreaks=[...peNegStreakArr].reverse();
+
+        // Check 2× increase: for each row, compare |change| to previous row's |change|
+        // In display order (newest first), "previous" row is at index i+1
+        for(let i=0;i<rows.length;i++){
+            const raw=rows[i]._raw||{};
+            const ceChg=Math.abs(raw.ce_oi_change||0);
+            const peChg=Math.abs(raw.pe_oi_change||0);
+            let ce2x=false,pe2x=false;
+            if(i<rows.length-1){
+                const prevRaw=rows[i+1]._raw||{};
+                const prevCe=Math.abs(prevRaw.ce_oi_change||0);
+                const prevPe=Math.abs(prevRaw.pe_oi_change||0);
+                if(prevCe>0&&ceChg>=prevCe*2)ce2x=true;
+                if(prevPe>0&&peChg>=prevPe*2)pe2x=true;
+            }
+            highlights2x.push({ce2x,pe2x});
+
+            // Row highlighting: 3 consecutive negative on one side WITH addition on opposite
+            let rowClass='';
+            // If Call OI negative for 3+ consecutive rows (in chronological order)
+            // ceStreaks[i] >= 3 means this row is at least the 3rd consecutive negative call change
+            if(ceStreaks[i]>=3){
+                const peChangePos=(raw.pe_oi_change||0)>0;
+                if(peChangePos)rowClass='row-highlight-green';
+            }
+            if(peStreaks[i]>=3){
+                const ceChangePos=(raw.ce_oi_change||0)>0;
+                if(ceChangePos)rowClass='row-highlight-red';
+            }
+            rowHighlights.push(rowClass);
+        }
+
         const tbody=document.getElementById('oi-table-body');
-        tbody.innerHTML=data.rows.map(r=>{
+        tbody.innerHTML=rows.map((r,i)=>{
             const raw=r._raw||{};
             const sig=r.signal||'N/A';const arrow=r.signal_arrow||'';
             const sigClass=sig==='LB'||sig==='SC'?'up':sig==='SB'||sig==='LU'?'down':'side';
+            const h2x=highlights2x[i]||{};
+            const rowCls=rowHighlights[i]||'';
+
             let cols=`<td class="col-time">${r.time}</td>`;
             if(dm==='total'){
                 cols+=`<td class="${vc(raw.total_pe_oi)}">${r.pe_oi_total}</td>`;
-                cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.pe_oi_change)}${h2x.pe2x?' oi-2x-highlight':''}">${r.pe_oi_change}</td>`;
                 cols+=`<td class="${vc(raw.total_ce_oi)}">${r.ce_oi_total}</td>`;
-                cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.ce_oi_change)}${h2x.ce2x?' oi-2x-highlight':''}">${r.ce_oi_change}</td>`;
             } else if(dm==='change'){
                 cols+=`<td class="${vc(raw.pe_oi_change_day)}">${r.pe_oi_change_day}</td>`;
-                cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.pe_oi_change)}${h2x.pe2x?' oi-2x-highlight':''}">${r.pe_oi_change}</td>`;
                 cols+=`<td class="${vc(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>`;
-                cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.ce_oi_change)}${h2x.ce2x?' oi-2x-highlight':''}">${r.ce_oi_change}</td>`;
             } else {
                 cols+=`<td class="${vc(raw.total_pe_oi)}">${r.pe_oi_total}</td>`;
                 cols+=`<td class="${vc(raw.pe_oi_change_day)}">${r.pe_oi_change_day}</td>`;
-                cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.pe_oi_change)}${h2x.pe2x?' oi-2x-highlight':''}">${r.pe_oi_change}</td>`;
                 cols+=`<td class="${vc(raw.total_ce_oi)}">${r.ce_oi_total}</td>`;
                 cols+=`<td class="${vc(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>`;
-                cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.ce_oi_change)}${h2x.ce2x?' oi-2x-highlight':''}">${r.ce_oi_change}</td>`;
             }
-            cols+=`<td class="${raw.pe_ce_diff>0?'val-pos':'val-neg'}">${r.pe_ce_total}</td>`;
+            cols+=`<td class="${raw.pe_ce_diff>0?'pe-ce-pos':'pe-ce-neg'}">${r.pe_ce_total}</td>`;
             cols+=`<td>${r.pcr?.toFixed(2)}</td>`;
             cols+=`<td class="val-neutral">${r.future_ltp}</td>`;
             cols+=`<td class="val-neutral">${r.straddle}</td>`;
@@ -191,7 +258,7 @@ async function loadOITable(){
             cols+=`<td class="${vc(r.ce_delta_chg)}">${r.ce_delta_chg>0?'+':''}${r.ce_delta_chg}</td>`;
             cols+=`<td class="${vc(r.pe_delta_chg)}">${r.pe_delta_chg>0?'+':''}${r.pe_delta_chg}</td>`;
             cols+=`<td><span class="signal-badge signal-${sigClass}">${arrow} ${sig}</span></td>`;
-            return `<tr>${cols}</tr>`;
+            return `<tr class="${rowCls}">${cols}</tr>`;
         }).join('');
     }catch(e){console.error('OI Table:',e);}
 }
