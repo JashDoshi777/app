@@ -322,7 +322,9 @@ class MarketDataService:
                 logger.warning("No NIFTY FUT contracts found in instrument master")
                 return
             fut["expiry_dt"] = pd.to_datetime(fut["expiry"], format="%d%b%Y", errors="coerce")
-            future_only = fut[fut["expiry_dt"] >= datetime.now(IST).replace(tzinfo=None)]
+            # Compare against today's DATE (not time) so current-day expiry is included
+            today_date = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+            future_only = fut[fut["expiry_dt"] >= today_date]
             if future_only.empty:
                 return
             nearest = future_only.loc[future_only["expiry_dt"].idxmin()]
@@ -552,12 +554,17 @@ class MarketDataService:
 
         # Get nearest expiry
         opts["expiry_dt"] = pd.to_datetime(opts["expiry"], format="%d%b%Y", errors="coerce")
-        future_expiries = opts[opts["expiry_dt"] >= datetime.now(IST).replace(tzinfo=None)]
+        # Compare against today's DATE (not time) so current-day expiry is included
+        today_date = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+        future_expiries = opts[opts["expiry_dt"] >= today_date]
         if future_expiries.empty:
             return []
 
         nearest_expiry = future_expiries["expiry_dt"].min()
         current = opts[opts["expiry_dt"] == nearest_expiry]
+        logger.info("[EXPIRY] Options using: %s (%d contracts, today=%s)",
+                    nearest_expiry.strftime("%d%b%Y"), len(current),
+                    today_date.strftime("%d%b%Y"))
 
         # Filter strikes near ATM — use wide range (±1000 points)
         # to ensure enough data for any user-selected range filter (up to ±20)
@@ -974,7 +981,9 @@ class MarketDataService:
                 return {"expiry": "--", "dte": 0, "label": "--", "expiry_date": ""}
 
             opts["expiry_dt"] = pd.to_datetime(opts["expiry"], format="%d%b%Y", errors="coerce")
-            future_expiries = opts[opts["expiry_dt"] >= datetime.now(IST).replace(tzinfo=None)]
+            # Compare against today's DATE (not time) so current-day expiry is included
+            today_date = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+            future_expiries = opts[opts["expiry_dt"] >= today_date]
             if future_expiries.empty:
                 return {"expiry": "--", "dte": 0, "label": "--", "expiry_date": ""}
 
