@@ -363,11 +363,22 @@ html, body {
 .signal-down { background: var(--red-bg); color: var(--red); }
 .signal-side { background: rgba(255,255,255,0.05); color: var(--text-dim); }
 
-/* ═══ 2× OI CHANGE HIGHLIGHT ═══ */
-.oi-2x-highlight {
-    background: rgba(255, 215, 0, 0.18) !important;
-    box-shadow: inset 0 0 0 1px rgba(255, 215, 0, 0.45);
-    font-weight: 700;
+/* ═══ DOWNLOAD BUTTON ═══ */
+.download-btn {
+    background: rgba(66, 165, 245, 0.15);
+    color: #42a5f5;
+    border: 1px solid rgba(66, 165, 245, 0.3);
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: 'Inter', sans-serif;
+    transition: all 0.2s;
+}
+.download-btn:hover {
+    background: rgba(66, 165, 245, 0.3);
+    border-color: #42a5f5;
 }
 
 /* ═══ CONSECUTIVE NEGATIVE ROW HIGHLIGHTS ═══ */
@@ -712,4 +723,54 @@ html, body {
     .logo-text { font-size: 12px; }
 
     .oi-table { min-width: 700px; }
+}
+
+/* ═══ COLUMN INFO ICON + POPUP ═══ */
+.col-info-icon {
+    cursor: pointer;
+    opacity: 0.35;
+    font-size: 10px;
+    margin-left: 3px;
+    vertical-align: middle;
+    transition: opacity 0.2s;
+    display: inline-block;
+}
+.col-info-icon:hover {
+    opacity: 1;
+}
+.col-info-popup {
+    position: fixed;
+    z-index: 9999;
+    background: rgba(22, 25, 40, 0.97);
+    border: 1px solid rgba(66, 165, 245, 0.25);
+    border-radius: 10px;
+    padding: 14px 18px;
+    max-width: 340px;
+    min-width: 220px;
+    color: #e8eaed;
+    font-size: 12px;
+    line-height: 1.7;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    white-space: pre-line;
+    backdrop-filter: blur(12px);
+    animation: infoFadeIn 0.15s ease-out;
+}
+@keyframes infoFadeIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.col-info-popup .info-title {
+    font-weight: 700;
+    color: #42a5f5;
+    font-size: 13px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    padding-bottom: 6px;
+}
+.col-info-popup .info-body {
+    color: rgba(232, 234, 237, 0.85);
+}
+.col-info-popup .info-highlight {
+    color: #4cffcb;
+    font-weight: 600;
 }

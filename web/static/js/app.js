@@ -12,7 +12,7 @@ let currentDisplayMode='total',autoATM=true;
 let charts={},tvChart=null,tvSeries=null;
 
 document.addEventListener('DOMContentLoaded',()=>{
-    initTabs();initTimeframeButtons();initModeButtons();initFilters();initDisplayMode();initATMMode();
+    initTabs();initTimeframeButtons();initModeButtons();initFilters();initDisplayMode();initATMMode();initDownload();
     startClock();checkMarketStatus();loadExpiryInfo();
     loadAllData();
     setInterval(()=>{if(currentMode==='live')loadAllData();},60000);
@@ -108,37 +108,70 @@ async function loadAllData(){
     }catch(e){console.error('loadAllData:',e);}
 }
 
+/* ═══ COLUMN INFO SYSTEM ═══ */
+const COL_INFO = {
+    time: {t:'Time', d:'IST timestamp of when this data snapshot was captured.\n\nData is refreshed every 60 seconds during market hours (9:15 AM – 3:30 PM IST).'},
+    put_oi: {t:'Put OI', d:'Total Put (PE) Open Interest summed across all strikes in the selected ATM ± Range.\n\nHigher Put OI generally indicates bearish hedging or bullish support (writers expect price to stay above).'},
+    put_total: {t:'Put OI → Total', d:'Current total Put OI across all strikes in the ATM ± Range filter.\n\nThis value is re-aggregated from per-strike data every refresh.'},
+    put_chg_day: {t:'Put OI → Chg (Day)', d:'Change in Put OI from previous trading day\'s closing value.\n\n• Positive = New put positions added today\n• Negative = Put positions closed/unwound today'},
+    put_change: {t:'Put OI → Change', d:'Put OI change from the previous row (based on selected timeframe).\n\n• Positive = Put OI increased this interval\n• Negative = Put OI decreased this interval\n\nThis is the real-time OI flow indicator.'},
+    call_oi: {t:'Call OI', d:'Total Call (CE) Open Interest summed across all strikes in the selected ATM ± Range.\n\nHigher Call OI generally indicates bullish speculation or bearish resistance (writers expect price to stay below).'},
+    call_total: {t:'Call OI → Total', d:'Current total Call OI across all strikes in the ATM ± Range filter.\n\nThis value is re-aggregated from per-strike data every refresh.'},
+    call_chg_day: {t:'Call OI → Chg (Day)', d:'Change in Call OI from previous trading day\'s closing value.\n\n• Positive = New call positions added today\n• Negative = Call positions closed/unwound today'},
+    call_change: {t:'Call OI → Change', d:'Call OI change from the previous row (based on selected timeframe).\n\n• Positive = Call OI increased this interval\n• Negative = Call OI decreased this interval\n\nThis is the real-time OI flow indicator.'},
+    pe_ce_oi: {t:'PE-CE OI', d:'Difference between Put OI and Call OI.\nFormula: Put OI − Call OI\n\n• Positive = More Puts than Calls → Bullish support\n• Negative = More Calls than Puts → Bearish pressure\n\nUsed to gauge net market sentiment.'},
+    pe_ce_total: {t:'PE-CE OI → Total', d:'Current PE-CE OI difference value.\n\nFormula: Total Put OI − Total Call OI\n(for strikes within ATM ± Range)'},
+    pe_ce_change: {t:'PE-CE OI → Change', d:'Change in PE-CE difference from the previous row.\n\n• Positive = Sentiment shifting bullish (more puts or fewer calls)\n• Negative = Sentiment shifting bearish (more calls or fewer puts)\n\nMatches StockMojo\'s "Change" column in PE-CE OI.'},
+    pcr: {t:'PCR (Put-Call Ratio)', d:'Put-Call Ratio = Total Put OI ÷ Total Call OI\n\n• Above 1.0 = More puts → Bullish support\n• 0.7 – 1.0 = Neutral zone\n• Below 0.7 = More calls → Bearish\n• Extreme values (>1.3 or <0.5) may signal reversals'},
+    ce_vol: {t:'CE Volume', d:'Total Call option trading volume across all strikes in the selected range.\n\nHigh volume = Active trading/liquidity on the call side.\nVolume shows activity, while OI shows outstanding positions.'},
+    pe_vol: {t:'PE Volume', d:'Total Put option trading volume across all strikes in the selected range.\n\nHigh volume = Active trading/liquidity on the put side.\nVolume shows activity, while OI shows outstanding positions.'},
+    total_oi: {t:'Total OI (Futures)', d:'NIFTY Futures Open Interest.\n\n• Rising OI = New positions being created\n• Falling OI = Existing positions being closed\n\nCombine with price direction for LB/SB/SC/LU signals.'},
+    signal: {t:'Signal', d:'Market action interpretation based on Futures Price + Total OI direction.\n\n• LB (Long Build): Price ↑ + OI ↑ → Bullish\n• SB (Short Build): Price ↓ + OI ↑ → Bearish\n• SC (Short Cover): Price ↑ + OI ↓ → Short-term Bullish\n• LU (Long Unwind): Price ↓ + OI ↓ → Short-term Bearish'},
+};
+function _i(key){return `<span class="col-info-icon" onclick="showColInfo('${key}',event)">ⓘ</span>`;}
+window.showColInfo=function(key,evt){
+    evt.stopPropagation();
+    const old=document.getElementById('col-info-popup');if(old)old.remove();
+    const info=COL_INFO[key];if(!info)return;
+    const popup=document.createElement('div');
+    popup.id='col-info-popup';popup.className='col-info-popup';
+    popup.innerHTML=`<div class="info-title">${info.t}</div><div class="info-body">${info.d}</div>`;
+    const rect=evt.target.getBoundingClientRect();
+    popup.style.top=Math.min(rect.bottom+8, window.innerHeight-200)+'px';
+    popup.style.left=Math.max(8, Math.min(rect.left, window.innerWidth-360))+'px';
+    document.body.appendChild(popup);
+    setTimeout(()=>{document.addEventListener('click',function dismiss(){popup.remove();document.removeEventListener('click',dismiss);},{once:true});},10);
+};
+
 function buildTableHeader(){
     const thead=document.getElementById('oi-table-head');if(!thead)return;
     const dm=currentDisplayMode;
     let h1='',h2='';
-    h1+='<th rowspan="2" class="col-time">Time</th>';
+    h1+=`<th rowspan="2" class="col-time">Time ${_i('time')}</th>`;
     if(dm==='total'||dm==='all'){
-        h1+=`<th colspan="${dm==='all'?3:2}" class="col-group put-header">Put OI</th>`;
-        h1+=`<th colspan="${dm==='all'?3:2}" class="col-group call-header">Call OI</th>`;
+        h1+=`<th colspan="${dm==='all'?3:2}" class="col-group put-header">Put OI ${_i('put_oi')}</th>`;
+        h1+=`<th colspan="${dm==='all'?3:2}" class="col-group call-header">Call OI ${_i('call_oi')}</th>`;
     } else {
-        h1+='<th colspan="2" class="col-group put-header">Put OI</th>';
-        h1+='<th colspan="2" class="col-group call-header">Call OI</th>';
+        h1+=`<th colspan="2" class="col-group put-header">Put OI ${_i('put_oi')}</th>`;
+        h1+=`<th colspan="2" class="col-group call-header">Call OI ${_i('call_oi')}</th>`;
     }
-    h1+='<th rowspan="2" class="col-group diff-header">PE-CE OI</th>';
-    h1+='<th rowspan="2" class="col-pcr">PCR</th>';
-    h1+='<th colspan="3" class="col-group future-header">Future</th>';
-    h1+='<th rowspan="2">Total OI</th>';
-    h1+='<th colspan="2" class="col-group" style="color:#26c6da">Delta Chg</th>';
-    h1+='<th rowspan="2" class="col-sentiment">Signal</th>';
+    h1+=`<th colspan="2" class="col-group diff-header">PE-CE OI ${_i('pe_ce_oi')}</th>`;
+    h1+=`<th rowspan="2" class="col-pcr">PCR ${_i('pcr')}</th>`;
+    h1+=`<th rowspan="2" style="color:#26a69a">CE Vol ${_i('ce_vol')}</th>`;
+    h1+=`<th rowspan="2" style="color:#ef5350">PE Vol ${_i('pe_vol')}</th>`;
+    h1+=`<th rowspan="2">Total OI ${_i('total_oi')}</th>`;
     // Sub headers
     if(dm==='total'){
-        h2+='<th class="sub">Total</th><th class="sub">Change</th>';
-        h2+='<th class="sub">Total</th><th class="sub">Change</th>';
+        h2+=`<th class="sub">Total ${_i('put_total')}</th><th class="sub">Change ${_i('put_change')}</th>`;
+        h2+=`<th class="sub">Total ${_i('call_total')}</th><th class="sub">Change ${_i('call_change')}</th>`;
     } else if(dm==='change'){
-        h2+='<th class="sub">Chg (Day)</th><th class="sub">Change</th>';
-        h2+='<th class="sub">Chg (Day)</th><th class="sub">Change</th>';
+        h2+=`<th class="sub">Chg (Day) ${_i('put_chg_day')}</th><th class="sub">Change ${_i('put_change')}</th>`;
+        h2+=`<th class="sub">Chg (Day) ${_i('call_chg_day')}</th><th class="sub">Change ${_i('call_change')}</th>`;
     } else {
-        h2+='<th class="sub">Total</th><th class="sub">Chg (Day)</th><th class="sub">Change</th>';
-        h2+='<th class="sub">Total</th><th class="sub">Chg (Day)</th><th class="sub">Change</th>';
+        h2+=`<th class="sub">Total ${_i('put_total')}</th><th class="sub">Chg (Day) ${_i('put_chg_day')}</th><th class="sub">Change ${_i('put_change')}</th>`;
+        h2+=`<th class="sub">Total ${_i('call_total')}</th><th class="sub">Chg (Day) ${_i('call_chg_day')}</th><th class="sub">Change ${_i('call_change')}</th>`;
     }
-    h2+='<th class="sub">LTP</th><th class="sub">Straddle</th><th class="sub">ATM</th>';
-    h2+='<th class="sub">CE</th><th class="sub">PE</th>';
+    h2+=`<th class="sub">Total ${_i('pe_ce_total')}</th><th class="sub">Change ${_i('pe_ce_change')}</th>`;
     thead.innerHTML=`<tr>${h1}</tr><tr>${h2}</tr>`;
 }
 
@@ -153,7 +186,7 @@ async function loadOITable(){
         if(rd&&data.range_display)rd.textContent=data.range_display;
         buildTableHeader();
         if(!data.rows||!data.rows.length){
-            document.getElementById('oi-table-body').innerHTML='<tr><td colspan="16" class="empty-msg">No data available</td></tr>';return;
+            document.getElementById('oi-table-body').innerHTML='<tr><td colspan="14" class="empty-msg">No data available</td></tr>';return;
         }
         const raw0=data.rows[0]._raw;
         if(raw0)document.getElementById('underlying-price').textContent=raw0.underlying?.toFixed(2)||'--';
@@ -161,9 +194,7 @@ async function loadOITable(){
         const rows=data.rows;
 
         // Pre-compute highlighting:
-        // 1) 2× OI change — compare absolute change to previous row's absolute change
-        // 2) 3-consecutive negative — track consecutive negative change in OI rows
-        const highlights2x=[];
+        // 3-consecutive negative — track consecutive negative change in OI rows
         const rowHighlights=[];
 
         // Rows are newest-first in data. We process in display order (newest first).
@@ -191,26 +222,10 @@ async function loadOITable(){
         const ceStreaks=[...ceNegStreakArr].reverse();
         const peStreaks=[...peNegStreakArr].reverse();
 
-        // Check 2× increase: for each row, compare |change| to previous row's |change|
-        // In display order (newest first), "previous" row is at index i+1
         for(let i=0;i<rows.length;i++){
             const raw=rows[i]._raw||{};
-            const ceChg=Math.abs(raw.ce_oi_change||0);
-            const peChg=Math.abs(raw.pe_oi_change||0);
-            let ce2x=false,pe2x=false;
-            if(i<rows.length-1){
-                const prevRaw=rows[i+1]._raw||{};
-                const prevCe=Math.abs(prevRaw.ce_oi_change||0);
-                const prevPe=Math.abs(prevRaw.pe_oi_change||0);
-                if(prevCe>0&&ceChg>=prevCe*2)ce2x=true;
-                if(prevPe>0&&peChg>=prevPe*2)pe2x=true;
-            }
-            highlights2x.push({ce2x,pe2x});
-
             // Row highlighting: 3 consecutive negative on one side WITH addition on opposite
             let rowClass='';
-            // If Call OI negative for 3+ consecutive rows (in chronological order)
-            // ceStreaks[i] >= 3 means this row is at least the 3rd consecutive negative call change
             if(ceStreaks[i]>=3){
                 const peChangePos=(raw.pe_oi_change||0)>0;
                 if(peChangePos)rowClass='row-highlight-green';
@@ -227,37 +242,33 @@ async function loadOITable(){
             const raw=r._raw||{};
             const sig=r.signal||'N/A';const arrow=r.signal_arrow||'';
             const sigClass=sig==='LB'||sig==='SC'?'up':sig==='SB'||sig==='LU'?'down':'side';
-            const h2x=highlights2x[i]||{};
             const rowCls=rowHighlights[i]||'';
 
             let cols=`<td class="col-time">${r.time}</td>`;
             if(dm==='total'){
                 cols+=`<td class="${vc(raw.total_pe_oi)}">${r.pe_oi_total}</td>`;
-                cols+=`<td class="${vc(raw.pe_oi_change)}${h2x.pe2x?' oi-2x-highlight':''}">${r.pe_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
                 cols+=`<td class="${vc(raw.total_ce_oi)}">${r.ce_oi_total}</td>`;
-                cols+=`<td class="${vc(raw.ce_oi_change)}${h2x.ce2x?' oi-2x-highlight':''}">${r.ce_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
             } else if(dm==='change'){
                 cols+=`<td class="${vc(raw.pe_oi_change_day)}">${r.pe_oi_change_day}</td>`;
-                cols+=`<td class="${vc(raw.pe_oi_change)}${h2x.pe2x?' oi-2x-highlight':''}">${r.pe_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
                 cols+=`<td class="${vc(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>`;
-                cols+=`<td class="${vc(raw.ce_oi_change)}${h2x.ce2x?' oi-2x-highlight':''}">${r.ce_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
             } else {
                 cols+=`<td class="${vc(raw.total_pe_oi)}">${r.pe_oi_total}</td>`;
                 cols+=`<td class="${vc(raw.pe_oi_change_day)}">${r.pe_oi_change_day}</td>`;
-                cols+=`<td class="${vc(raw.pe_oi_change)}${h2x.pe2x?' oi-2x-highlight':''}">${r.pe_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
                 cols+=`<td class="${vc(raw.total_ce_oi)}">${r.ce_oi_total}</td>`;
                 cols+=`<td class="${vc(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>`;
-                cols+=`<td class="${vc(raw.ce_oi_change)}${h2x.ce2x?' oi-2x-highlight':''}">${r.ce_oi_change}</td>`;
+                cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
             }
             cols+=`<td class="${raw.pe_ce_diff>0?'pe-ce-pos':'pe-ce-neg'}">${r.pe_ce_total}</td>`;
+            cols+=`<td class="${vc(raw.pe_ce_diff_change)}">${r.pe_ce_change}</td>`;
             cols+=`<td>${r.pcr?.toFixed(2)}</td>`;
-            cols+=`<td class="val-neutral">${r.future_ltp}</td>`;
-            cols+=`<td class="val-neutral">${r.straddle}</td>`;
-            cols+=`<td class="val-neutral">${r.atm_strike}</td>`;
+            cols+=`<td class="val-neutral">${r.ce_volume||'0'}</td>`;
+            cols+=`<td class="val-neutral">${r.pe_volume||'0'}</td>`;
             cols+=`<td class="val-neutral">${r.total_oi||'--'}</td>`;
-            cols+=`<td class="${vc(r.ce_delta_chg)}">${r.ce_delta_chg>0?'+':''}${r.ce_delta_chg}</td>`;
-            cols+=`<td class="${vc(r.pe_delta_chg)}">${r.pe_delta_chg>0?'+':''}${r.pe_delta_chg}</td>`;
-            cols+=`<td><span class="signal-badge signal-${sigClass}">${arrow} ${sig}</span></td>`;
             return `<tr class="${rowCls}">${cols}</tr>`;
         }).join('');
     }catch(e){console.error('OI Table:',e);}
@@ -310,3 +321,20 @@ function renderPutPriceOI(data){const ctx=document.getElementById('chart-put-pri
 function renderStraddle(data){const ctx=document.getElementById('chart-straddle');if(!ctx)return;if(charts.straddle){charts.straddle.destroy();charts.straddle=null;}const sd=data.straddle||[];if(!sd.length)return;const labels=sd.map(d=>(d.timestamp?.split('T')[1]||'').slice(0,5));charts.straddle=new Chart(ctx,{type:'line',data:{labels,datasets:[{label:'Straddle',data:sd.map(d=>d.price),borderColor:C.blue,borderWidth:2,pointRadius:2,pointHoverRadius:5,tension:0.3,fill:true,backgroundColor:'rgba(66,165,245,0.08)'}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},hover:{mode:'index',intersect:false},plugins:{tooltip:{enabled:true,backgroundColor:'rgba(20,22,32,0.95)',borderColor:'rgba(255,255,255,0.1)',borderWidth:1,titleFont:{weight:'600'},bodyFont:{size:12},padding:10,callbacks:{label:c=>`Straddle: ₹${c.raw?.toFixed(2)}`}}},scales:{x:{grid:{display:false},ticks:{maxTicksLimit:10}},y:{position:'left',grid:{color:'rgba(255,255,255,0.03)'},ticks:{callback:v=>'₹'+v.toFixed(0)}}}}});}
 function dualOpts(lbl,rbl){return{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},hover:{mode:'index',intersect:false},plugins:{tooltip:{enabled:true,backgroundColor:'rgba(20,22,32,0.95)',borderColor:'rgba(255,255,255,0.1)',borderWidth:1,titleFont:{weight:'600'},bodyFont:{size:12},padding:10,callbacks:{label:c=>c.datasetIndex===0?`OI: ${fmtL(c.raw)}`:`Price: ₹${c.raw?.toFixed(2)}`}}},scales:{x:{grid:{display:false},ticks:{maxTicksLimit:10}},y:{position:'left',grid:{color:'rgba(255,255,255,0.03)'},ticks:{callback:v=>fmtL(v)},title:{display:true,text:lbl,color:'rgba(255,255,255,0.3)'}},y1:{position:'right',grid:{display:false},ticks:{callback:v=>'₹'+v.toFixed(0)},title:{display:true,text:rbl,color:'rgba(255,255,255,0.3)'}}}};}
 function fmtL(n){if(n===null||n===undefined)return'--';const a=Math.abs(n);if(a>=1e7)return(n/1e7).toFixed(1)+' Cr';if(a>=1e5)return(n/1e5).toFixed(1)+' L';if(a>=1e3)return(n/1e3).toFixed(1)+' K';return n.toString();}
+
+/* ═══ CSV DOWNLOAD ═══ */
+function initDownload(){
+    const btn=document.getElementById('download-csv-btn');
+    if(btn)btn.addEventListener('click',downloadCSV);
+}
+function downloadCSV(){
+    const rng=document.getElementById('strike-range');const range=rng?rng.value:5;
+    let url=`/api/download-oi?tf=${currentTf}&range_strikes=${range}&auto_atm=${autoATM}`;
+    if(currentMode==='historical'&&historicalDate){
+        url+=`&mode=historical&date=${historicalDate}`;
+    }
+    // Trigger download via hidden link
+    const a=document.createElement('a');
+    a.href=url;a.download='';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+}

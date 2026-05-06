@@ -6,7 +6,7 @@
     <title>NIFTY OI Tracker — Live</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css?v=11">
+    <link rel="stylesheet" href="/static/css/style.css?v=12">
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
         body{font-family:'Inter',sans-serif;background:#0c0e14;color:#e8eaed;min-height:100vh;font-size:13px}
@@ -52,6 +52,7 @@
             <button class="tf-btn active" data-tf="1">1m</button>
             <button class="tf-btn" data-tf="3">3m</button>
             <button class="tf-btn" data-tf="5">5m</button>
+            <button class="tf-btn" data-tf="10">10m</button>
             <button class="tf-btn" data-tf="15">15m</button>
             <button class="tf-btn" data-tf="30">30m</button>
         </div>
@@ -122,6 +123,7 @@
                 <button class="display-btn" data-display="change">OI Change (Day)</button>
                 <button class="display-btn" data-display="all">All</button>
             </div>
+                <button class="download-btn" id="download-csv-btn" title="Download CSV">⬇ CSV</button>
         </div>
     </div>
     <div class="table-container">
@@ -188,6 +190,6 @@
     </div>
 </section>
 
-<script src="/static/js/app.js?v=11"></script>
+<script src="/static/js/app.js?v=12"></script>
 </body>
 </html>

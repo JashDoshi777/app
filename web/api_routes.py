@@ -8,6 +8,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Query
+from fastapi.responses import Response
 from typing import Optional
 import numpy as np
 import config
@@ -338,6 +339,8 @@ async def get_oi_table(
             ce_chg_oi_day = ranged["ce_chg_oi"]
             pe_ce_diff = ranged["pe_ce_diff"]
             pcr = ranged["pcr"]
+            ce_volume = ranged["total_ce_vol"]
+            pe_volume = ranged["total_pe_vol"]
         else:
             total_pe_oi = r["total_pe_oi"]
             total_ce_oi = r["total_ce_oi"]
@@ -345,6 +348,8 @@ async def get_oi_table(
             ce_chg_oi_day = r.get("ce_oi_change_day", 0)
             pe_ce_diff = r["pe_ce_diff"]
             pcr = r["pcr"]
+            ce_volume = 0
+            pe_volume = 0
 
         # Extract ATM CE/PE LTP from per-strike data for the CURRENT ATM
         # This ensures Delta Change uses the correct strike even if ATM shifted
@@ -368,6 +373,8 @@ async def get_oi_table(
             "atm": atm,
             "atm_ce_ltp": atm_ce_ltp,
             "atm_pe_ltp": atm_pe_ltp,
+            "ce_volume": ce_volume,
+            "pe_volume": pe_volume,
         })
 
     # STEP 4: Second pass — compute deltas between FILTERED rows (correct for any timeframe)
@@ -433,6 +440,8 @@ async def get_oi_table(
             "total_oi": _fmt_lakh(total_oi) if total_oi else "--",
             "ce_delta_chg": ce_delta_chg,
             "pe_delta_chg": pe_delta_chg,
+            "ce_volume": _fmt_lakh(e["ce_volume"]),
+            "pe_volume": _fmt_lakh(e["pe_volume"]),
             "signal": signal,
             "signal_arrow": sig_arrow,
             "_raw": {
@@ -447,6 +456,8 @@ async def get_oi_table(
                 "pe_oi_change": pe_oi_change,
                 "ce_oi_change": ce_oi_change,
                 "total_oi": total_oi,
+                "ce_volume": e["ce_volume"],
+                "pe_volume": e["pe_volume"],
             },
         })
 
@@ -454,6 +465,49 @@ async def get_oi_table(
     formatted.reverse()
 
     return _sanitize({"rows": formatted, "range_display": latest_range_display})
+
+
+@router.get("/download-oi")
+async def download_oi_csv(
+    tf: int = Query(1),
+    range_strikes: int = Query(5),
+    auto_atm: bool = Query(True),
+    mode: str = Query("live"),
+    date: str = Query(""),
+):
+    """Download OI table data as CSV."""
+    import io, csv
+    # Reuse the existing OI table endpoint logic
+    data = await get_oi_table(tf=tf, range_strikes=range_strikes, auto_atm=auto_atm, mode=mode, date=date)
+    rows = data.get("rows", []) if isinstance(data, dict) else []
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    # Header
+    writer.writerow([
+        "Time", "Put OI Total", "Put OI Chg(Day)", "Put OI Change",
+        "Call OI Total", "Call OI Chg(Day)", "Call OI Change",
+        "PE-CE OI", "PE-CE Change", "PCR",
+        "CE Volume", "PE Volume", "Total OI",
+        "Future LTP", "Straddle", "ATM", "Signal"
+    ])
+    for r in rows:
+        writer.writerow([
+            r.get("time", ""),
+            r.get("pe_oi_total", ""), r.get("pe_oi_change_day", ""), r.get("pe_oi_change", ""),
+            r.get("ce_oi_total", ""), r.get("ce_oi_change_day", ""), r.get("ce_oi_change", ""),
+            r.get("pe_ce_total", ""), r.get("pe_ce_change", ""), r.get("pcr", ""),
+            r.get("ce_volume", ""), r.get("pe_volume", ""), r.get("total_oi", ""),
+            r.get("future_ltp", ""), r.get("straddle", ""), r.get("atm_strike", ""),
+            r.get("signal", "")
+        ])
+
+    filename = f"NIFTY_OI_{date or datetime.now(IST).strftime('%Y-%m-%d')}_{tf}m.csv"
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
 
 
 def _compute_signal_from_data(cur_price, prev_price, cur_total_oi, prev_total_oi):
@@ -1017,7 +1071,7 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         ts_strike_groups = {}
         if has_strikes:
             cur.execute("""
-                SELECT timestamp, strike, ce_oi, pe_oi, ce_ltp, pe_ltp
+                SELECT timestamp, strike, ce_oi, pe_oi, ce_ltp, pe_ltp, ce_volume, pe_volume
                 FROM oi_snapshots
                 WHERE symbol = 'NIFTY'
                   AND DATE(timestamp AT TIME ZONE 'Asia/Kolkata') = %s
@@ -1033,6 +1087,8 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                     "pe_oi": int(row[3] or 0),
                     "ce_ltp": float(row[4] or 0),
                     "pe_ltp": float(row[5] or 0),
+                    "ce_volume": int(row[6] or 0),
+                    "pe_volume": int(row[7] or 0),
                 })
 
         cur.close()
@@ -1098,6 +1154,8 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                 filtered = [s for s in strikes if abs(s["strike"] - atm) <= effective_range * si]
                 total_ce = sum(s["ce_oi"] for s in filtered)
                 total_pe = sum(s["pe_oi"] for s in filtered)
+                ce_vol = sum(s.get("ce_volume", 0) for s in filtered)
+                pe_vol = sum(s.get("pe_volume", 0) for s in filtered)
                 # Extract ATM CE/PE LTP from per-strike data
                 atm_ce = float(r.get("atm_ce_ltp", 0) or 0)
                 atm_pe = float(r.get("atm_pe_ltp", 0) or 0)
@@ -1111,6 +1169,8 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                 total_ce = int(r.get("total_ce_oi", 0) or 0)
                 atm_ce = float(r.get("atm_ce_ltp", 0) or 0)
                 atm_pe = float(r.get("atm_pe_ltp", 0) or 0)
+                ce_vol = int(r.get("total_ce_volume", 0) or 0)
+                pe_vol = int(r.get("total_pe_volume", 0) or 0)
 
             intermediate.append({
                 "time_str": time_str,
@@ -1123,6 +1183,8 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                 "atm_pe": atm_pe,
                 "underlying": float(r.get("underlying_price", 0) or 0),
                 "futures_oi": foi_map.get(ts, 0),
+                "ce_vol": ce_vol,
+                "pe_vol": pe_vol,
                 "timestamp": time_str,  # needed for _filter_by_timeframe
             })
 
@@ -1193,6 +1255,8 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                 "total_oi": _fmt_lakh(total_oi) if total_oi else "--",
                 "ce_delta_chg": ce_delta_chg,
                 "pe_delta_chg": pe_delta_chg,
+                "ce_volume": _fmt_lakh(item.get("ce_vol", 0)),
+                "pe_volume": _fmt_lakh(item.get("pe_vol", 0)),
                 "signal": signal,
                 "signal_arrow": sig_arrow,
                 "_raw": {
@@ -1207,6 +1271,8 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                     "pe_oi_change": pe_chg_min,
                     "ce_oi_change": ce_chg_min,
                     "total_oi": total_oi,
+                    "ce_volume": item.get("ce_vol", 0),
+                    "pe_volume": item.get("pe_vol", 0),
                 },
             })
 
