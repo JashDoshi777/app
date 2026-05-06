@@ -488,8 +488,7 @@ async def download_oi_csv(
         "Time", "Put OI Total", "Put OI Chg(Day)", "Put OI Change",
         "Call OI Total", "Call OI Chg(Day)", "Call OI Change",
         "PE-CE OI", "PE-CE Change", "PCR",
-        "CE Volume", "PE Volume", "Total OI",
-        "Future LTP", "Straddle", "ATM", "Signal"
+        "CE Volume", "PE Volume", "Total OI"
     ])
     for r in rows:
         writer.writerow([
@@ -498,8 +497,6 @@ async def download_oi_csv(
             r.get("ce_oi_total", ""), r.get("ce_oi_change_day", ""), r.get("ce_oi_change", ""),
             r.get("pe_ce_total", ""), r.get("pe_ce_change", ""), r.get("pcr", ""),
             r.get("ce_volume", ""), r.get("pe_volume", ""), r.get("total_oi", ""),
-            r.get("future_ltp", ""), r.get("straddle", ""), r.get("atm_strike", ""),
-            r.get("signal", "")
         ])
 
     filename = f"NIFTY_OI_{date or datetime.now(IST).strftime('%Y-%m-%d')}_{tf}m.csv"
