@@ -21,8 +21,8 @@
 | **1. Login** | App logs into your Angel One demat account using API key, client ID, password, and TOTP secret |
 | **2. WebSocket** | Opens a real-time WebSocket connection for instant NIFTY/BANKNIFTY price ticks (<50ms delay) |
 | **3. Every 60s** | A background thread fetches the full option chain (all strikes, CE & PE) via REST API |
-| **4. Compute** | Calculates totals — Total CE OI, Total PE OI, PE-CE Diff, PCR, Straddle, Signal, Greeks, IV |
-| **5. Store** | Saves snapshot to NeonDB (PostgreSQL) for historical playback |
+| **4. Compute** | Calculates totals — Total CE OI, Total PE OI, PE-CE Diff, PCR, Volume, Greeks, IV |
+| **5. Store** | Saves snapshot to NeonDB (PostgreSQL) for historical playback — including per-strike volume |
 | **6. Display** | Serves data via FastAPI REST endpoints → rendered in browser as table + charts |
 
 ---
@@ -39,7 +39,7 @@
 
 ## 📊 The OI Data Table — Every Column Explained
 
-The main table has **17 columns** organized into groups. Here is every single one:
+The main table has **11 columns** (in "Total OI" display mode) organized into groups. Here is every single one:
 
 ---
 
@@ -53,9 +53,9 @@ The main table has **17 columns** organized into groups. Here is every single on
 
 ---
 
-### 🟢 Columns 2-4: `Put OI` Group (3 sub-columns)
+### 🟢 Columns 2-4: `Put OI` Group (2-3 sub-columns depending on display mode)
 
-#### 2. Put OI → Total
+#### Put OI → Total
 | Detail | Value |
 |--------|-------|
 | **What it shows** | Sum of Open Interest across ALL Put (PE) option contracts within selected strike range |
@@ -63,7 +63,7 @@ The main table has **17 columns** organized into groups. Here is every single on
 | **Example** | If ATM is 24000, Range=10 → sums PE OI from strike 23500 to 24500 |
 | **Displayed as** | Lakh notation: `45.2 L` = 45,20,000 contracts |
 
-#### 3. Put OI → Chg (Day)
+#### Put OI → Chg (Day)
 | Detail | Value |
 |--------|-------|
 | **What it shows** | How much PE OI has changed **since previous day's close** |
@@ -71,24 +71,24 @@ The main table has **17 columns** organized into groups. Here is every single on
 | **Positive (+)** | New put positions added today → **Bullish** (writers selling puts = expecting support) |
 | **Negative (-)** | Put positions closed today → **Bearish** (support being removed) |
 
-#### 4. Put OI → Change
+#### Put OI → Change
 | Detail | Value |
 |--------|-------|
-| **What it shows** | How much PE OI changed **since the last snapshot** (minute-to-minute) |
-| **How calculated** | `pe_oi_change = current_total_pe_oi - previous_minute_total_pe_oi` |
+| **What it shows** | How much PE OI changed **since the last snapshot** (row-to-row based on timeframe) |
+| **How calculated** | `pe_oi_change = current_total_pe_oi - previous_row_total_pe_oi` |
 | **Why it matters** | Shows real-time flow — are traders adding or removing puts RIGHT NOW? |
 
 ---
 
-### 🔴 Columns 5-7: `Call OI` Group (3 sub-columns)
+### 🔴 Columns 5-7: `Call OI` Group (2-3 sub-columns depending on display mode)
 
-#### 5. Call OI → Total
+#### Call OI → Total
 | Detail | Value |
 |--------|-------|
 | **What it shows** | Sum of Open Interest across ALL Call (CE) option contracts within selected strike range |
 | **How calculated** | `total_ce_oi = sum of ce_oi for all strikes within range` |
 
-#### 6. Call OI → Chg (Day)
+#### Call OI → Chg (Day)
 | Detail | Value |
 |--------|-------|
 | **What it shows** | How much CE OI has changed **since previous day's close** |
@@ -96,41 +96,37 @@ The main table has **17 columns** organized into groups. Here is every single on
 | **Positive (+)** | New call positions added today → **Bearish** (writers selling calls = expecting resistance) |
 | **Negative (-)** | Call positions closed today → **Bullish** (resistance being removed) |
 
-#### 7. Call OI → Change
+#### Call OI → Change
 | Detail | Value |
 |--------|-------|
-| **What it shows** | How much CE OI changed since the last snapshot (minute-to-minute) |
-| **How calculated** | `ce_oi_change = current_total_ce_oi - previous_minute_total_ce_oi` |
+| **What it shows** | How much CE OI changed since the last snapshot (row-to-row) |
+| **How calculated** | `ce_oi_change = current_total_ce_oi - previous_row_total_ce_oi` |
 
 ---
 
-### 🟣 Columns 8-10: `PE - CE OI` Difference Group
+### 🟣 Columns 8-9: `PE-CE OI` Group (2 sub-columns: Total + Change)
 
-#### 8. PE-CE → Total
+#### PE-CE OI → Total
 | Detail | Value |
 |--------|-------|
 | **What it shows** | The raw difference between total Put OI and total Call OI |
 | **How calculated** | `pe_ce_diff = total_pe_oi - total_ce_oi` |
 | **Positive (+)** | More puts than calls → **Bullish** (more support being built) |
 | **Negative (-)** | More calls than puts → **Bearish** (more resistance being built) |
+| **Color** | Green background for positive, Red background for negative |
 
-#### 9. PE-CE → Chg (Day)
+#### PE-CE OI → Change
 | Detail | Value |
 |--------|-------|
-| **What it shows** | How the PE-CE difference has shifted today vs yesterday |
-| **How calculated** | `pe_ce_chg_day = pe_chg_oi_day - ce_chg_oi_day` |
-| **Rising** | Puts being added faster than calls → market getting more bullish support |
-| **Falling** | Calls being added faster than puts → market getting more bearish resistance |
-
-#### 10. PE-CE → Change
-| Detail | Value |
-|--------|-------|
-| **What it shows** | Minute-to-minute change in the PE-CE difference |
-| **How calculated** | `pe_ce_diff_change = current_pe_ce_diff - previous_minute_pe_ce_diff` |
+| **What it shows** | How the PE-CE difference changed from the previous row |
+| **How calculated** | `pe_ce_diff_change = current_pe_ce_diff - previous_row_pe_ce_diff` |
+| **Positive (+)** | Sentiment shifting bullish (more puts or fewer calls vs previous row) |
+| **Negative (-)** | Sentiment shifting bearish (more calls or fewer puts vs previous row) |
+| **Matches** | StockMojo's "Change" column in the PE-CE OI section |
 
 ---
 
-### 📈 Column 11: `PCR` (Put-Call Ratio)
+### 📈 Column 10: `PCR` (Put-Call Ratio)
 
 | Detail | Value |
 |--------|-------|
@@ -143,189 +139,101 @@ The main table has **17 columns** organized into groups. Here is every single on
 
 ---
 
-### 💰 Columns 12-14: `Future` Group
+### 📊 Column 11: `CE Volume`
 
-#### 12. Future → LTP
 | Detail | Value |
 |--------|-------|
-| **What it shows** | Last Traded Price of NIFTY Futures (nearest month contract) |
-| **How calculated** | Fetched via WebSocket or REST API from Angel One. Falls back to spot price if unavailable |
-| **Why not Spot?** | Futures price includes "cost of carry" and is what institutional traders actually trade |
+| **What it shows** | Total Call option trading volume across all strikes in the selected ATM ± Range |
+| **How calculated** | `ce_volume = sum of ce_volume for all strikes within range` |
+| **Why it matters** | High volume = active trading/liquidity on the call side. Volume shows trading activity, OI shows outstanding positions |
+| **Data source** | Per-strike volume from Angel One API, aggregated within range |
 
-#### 13. Future → Straddle
+### 📊 Column 12: `PE Volume`
+
 | Detail | Value |
 |--------|-------|
-| **What it shows** | ATM Straddle price = ATM Call LTP + ATM Put LTP |
-| **How calculated** | `straddle = atm_ce_ltp + atm_pe_ltp` |
-| **Why it matters** | Shows the market's expected range for the day. If straddle = 200, market expects NIFTY to move ±200 points from ATM |
-| **Falling straddle** | Volatility decreasing → market settling into a range |
-| **Rising straddle** | Volatility increasing → big move expected |
-
-#### 14. Future → ATM
-| Detail | Value |
-|--------|-------|
-| **What it shows** | The At-The-Money strike price (nearest strike to current NIFTY price) |
-| **How calculated** | `atm = round(underlying / 50) * 50` — rounds to nearest 50 (NIFTY strike interval) |
-| **Example** | If NIFTY = 24,123 → ATM = 24,100. If NIFTY = 24,138 → ATM = 24,150 |
+| **What it shows** | Total Put option trading volume across all strikes in the selected ATM ± Range |
+| **How calculated** | `pe_volume = sum of pe_volume for all strikes within range` |
+| **Why it matters** | High volume = active trading/liquidity on the put side |
+| **Historical** | Volume is saved to DB per-strike (`oi_snapshots.ce_volume`, `oi_snapshots.pe_volume`) and available in historical mode |
 
 ---
 
-### 🔷 Columns 15-16: `Delta Chg` Group
+### 🔷 Column 13: `Total OI`
 
-#### 15. Delta Chg → CE
 | Detail | Value |
 |--------|-------|
-| **What it shows** | How much the ATM Call option price changed since last snapshot |
-| **How calculated** | `ce_delta_chg = current_atm_ce_ltp - previous_atm_ce_ltp` |
-| **Positive** | Call premium increasing → market moving up |
-| **Negative** | Call premium decreasing → market moving down or time decay eating premium |
-
-#### 16. Delta Chg → PE
-| Detail | Value |
-|--------|-------|
-| **What it shows** | How much the ATM Put option price changed since last snapshot |
-| **How calculated** | `pe_delta_chg = current_atm_pe_ltp - previous_atm_pe_ltp` |
-| **Positive** | Put premium increasing → market moving down |
-| **Negative** | Put premium decreasing → market moving up or time decay |
+| **What it shows** | NIFTY Futures Open Interest |
+| **How calculated** | Fetched from the futures contract data via Angel One API |
+| **Rising OI** | New positions being created |
+| **Falling OI** | Existing positions being closed |
 
 ---
 
-### 🚦 Column 17: `Signal` — THE MOST IMPORTANT COLUMN
+## 📦 Display Modes
 
-This tells you what institutional traders are doing RIGHT NOW.
+The table supports three display modes (toggled via buttons):
 
-| Signal | Full Name | Price Direction | OI Direction | What It Means |
-|--------|-----------|----------------|--------------|---------------|
-| **LB** | Long Buildup | ↑ Price Going Up | ↑ OI Increasing | Fresh buying! New longs entering. **Strong Bullish** |
-| **SB** | Short Buildup | ↓ Price Going Down | ↑ OI Increasing | Fresh shorting! New shorts entering. **Strong Bearish** |
-| **SC** | Short Covering | ↑ Price Going Up | ↓ OI Decreasing | Shorts panicking & exiting. **Weak Bullish** (reversal risk) |
-| **LU** | Long Unwinding | ↓ Price Going Down | ↓ OI Decreasing | Longs giving up & exiting. **Weak Bearish** (may stabilize) |
-| **S** | Startup/Neutral | — | — | First reading, no prior data to compare |
+| Mode | Put OI Shows | Call OI Shows | PE-CE OI Shows |
+|------|-------------|--------------|----------------|
+| **Total OI** | Total + Change | Total + Change | Total + Change |
+| **OI Change (Day)** | Chg(Day) + Change | Chg(Day) + Change | Total + Change |
+| **All** | Total + Chg(Day) + Change | Total + Chg(Day) + Change | Total + Change |
 
-#### How Signal is Calculated
+---
 
+## ⏱️ Timeframe Filters
+
+| Button | What it does |
+|--------|-------------|
+| **1m** | Shows every minute's data (default) |
+| **3m** | Aggregates to 3-minute intervals |
+| **5m** | Aggregates to 5-minute intervals |
+| **10m** | Aggregates to 10-minute intervals |
+| **15m** | Aggregates to 15-minute intervals (matches StockMojo) |
+| **30m** | Aggregates to 30-minute intervals |
+
+The timeframe filter works by selecting the row nearest to each time window boundary. Change values are recalculated between the filtered rows.
+
+---
+
+## ⬇️ CSV Download
+
+- Click the **⬇ CSV** button next to the display mode buttons
+- Downloads the currently displayed data as a CSV file
+- Filename format: `NIFTY_OI_2026-05-07_1m.csv` (date + timeframe)
+- Works for both **Live** and **Historical** mode
+- Uses the same data as the table (same range, timeframe, ATM mode)
+
+### CSV Columns (13 total):
 ```
-1. Compare current NIFTY price vs previous snapshot price → price_up = True/False
-2. Compare current Total OI (CE+PE) vs previous Total OI → oi_up = True/False
-3. Combine:
-   - Price UP + OI UP   = LB (Long Buildup)
-   - Price DOWN + OI UP  = SB (Short Buildup)
-   - Price UP + OI DOWN  = SC (Short Covering)
-   - Price DOWN + OI DOWN = LU (Long Unwinding)
+Time, Put OI Total, Put OI Chg(Day), Put OI Change,
+Call OI Total, Call OI Chg(Day), Call OI Change,
+PE-CE OI, PE-CE Change, PCR,
+CE Volume, PE Volume, Total OI
 ```
 
 ---
 
-## 🔍 LU and SC Explained In Detail
+## ⓘ Column Info Icons
 
-### 📉 LU — Long Unwinding
+Every column header and sub-column header has a small **ⓘ** info icon.
 
-> **"Longs are giving up and leaving the market"**
-
-| Aspect | Detail |
-|--------|--------|
-| **What's happening** | Traders who had bought (gone long) are now selling their positions and exiting |
-| **Price** | Going **DOWN** ↓ |
-| **Open Interest** | Going **DOWN** ↓ (positions being closed, not new ones being created) |
-| **Market feel** | Weak, tired, lack of buying conviction |
-| **Why it happens** | Buyers are booking profits or cutting losses. No fresh buying interest |
-| **Strength** | **Weak bearish** — the fall may slow down because sellers are exiting too |
-| **What to expect** | Market may find support soon OR could accelerate if fresh shorts (SB) follow |
-
-**Example**: NIFTY at 24,200. LU appears for 3 consecutive readings. Price drops to 24,150 but OI also drops. This means the fall is happening because buyers are LEAVING, not because sellers are ATTACKING. The fall may stop once all weak longs exit.
-
-### 📈 SC — Short Covering
-
-> **"Shorts are panicking and buying back to exit"**
-
-| Aspect | Detail |
-|--------|--------|
-| **What's happening** | Traders who had sold (shorted) are now buying back their positions to close them |
-| **Price** | Going **UP** ↑ |
-| **Open Interest** | Going **DOWN** ↓ (positions being closed, not new ones being created) |
-| **Market feel** | Artificially strong — rally driven by panic, not conviction |
-| **Why it happens** | Shorts are losing money as price rises, so they rush to exit (buy back) |
-| **Strength** | **Weak bullish** — the rise may stop once all shorts have covered |
-| **What to expect** | The up-move may be temporary. If no fresh buying (LB) follows, price can reverse back down |
-
-**Example**: NIFTY at 24,000. SB signal was showing all morning (shorts entering). Suddenly price jumps to 24,100 and signal flips to SC. This means shorts are panicking — but the rally is NOT because new buyers arrived. Once covering is done, the move may fizzle out.
+- **Click** the icon → a popup appears with a detailed explanation of that column
+- **Click anywhere outside** → popup dismisses
+- Covers all 17 unique column/sub-column definitions
+- Includes formulas, interpretation guides, and bullish/bearish signals
 
 ---
 
-## ⏰ Ideal Trading Times
+## 🎨 Row Highlighting
 
-### Best Times to Trade
+The table highlights rows based on consecutive OI patterns:
 
-| Time Window | Why | Signal to Watch |
-|-------------|-----|-----------------|
-| **9:30 – 10:00 AM** | Initial OI data stabilizes. First clear signals emerge after opening volatility settles | Wait for 2-3 consistent LB or SB signals |
-| **10:00 – 11:30 AM** | **PRIME TRADING WINDOW**. Institutions place their positions. OI data is most reliable | Look for strong LB/SB with rising PE-CE diff confirming direction |
-| **11:30 – 1:00 PM** | Lunch lull — lower volume, signals can be noisy | Avoid new trades unless strong LB/SB persists from morning |
-| **1:30 – 2:30 PM** | **SECOND BEST WINDOW**. Institutions adjust positions for closing. Fresh moves start | Watch for signal transitions (SB→LB = reversal, SC→SB = trap) |
-| **2:30 – 3:15 PM** | Expiry day scramble (Thursdays). High volatility, OI data changes rapidly | Only trade if you're experienced; straddle values collapse fast |
-
-### Times to AVOID Trading
-
-| Time | Why |
-|------|-----|
-| **9:15 – 9:30 AM** | Opening chaos. Spreads are wide, data hasn't stabilized, first signal is always "S" (no prior data) |
-| **3:15 – 3:30 PM** | Last 15 minutes. Extremely volatile, low liquidity, slippage risk |
-| **When signal = S** | No data to compare. Wait for LB/SB/SC/LU to appear |
-
----
-
-## 🎯 When to Take Trades — Signal-Based Strategy
-
-### ✅ STRONG BUY Signal (Go Long / Buy CE)
-
-All of these should be true simultaneously:
-
-| Condition | What to Check |
-|-----------|---------------|
-| Signal = **LB** | 2-3 consecutive LB readings (not just one) |
-| PE-CE Diff | **Positive and rising** (more puts than calls, difference growing) |
-| PCR | **Above 0.9** and rising |
-| Put OI Chg (Day) | **Positive** (new puts being added = support building) |
-| Straddle | **Stable or falling** (market settling, not panicking) |
-| CE Delta Chg | **Positive** (call premiums rising = market moving up) |
-
-### ✅ STRONG SELL Signal (Go Short / Buy PE)
-
-All of these should be true simultaneously:
-
-| Condition | What to Check |
-|-----------|---------------|
-| Signal = **SB** | 2-3 consecutive SB readings |
-| PE-CE Diff | **Negative and falling** (more calls than puts, difference growing negative) |
-| PCR | **Below 0.8** and falling |
-| Call OI Chg (Day) | **Positive** (new calls being added = resistance building) |
-| Straddle | **Stable or falling** |
-| PE Delta Chg | **Positive** (put premiums rising = market moving down) |
-
-### ⚠️ AVOID Trading When
-
-| Condition | Why |
-|-----------|-----|
-| Signal alternating LB↔SB | Choppy/sideways market, no clear direction |
-| Signal = SC for 3+ readings | Rally is fake (just short covering), may reverse |
-| Signal = LU for 3+ readings | Fall is exhausting, may bounce — bad time to short |
-| PCR between 0.85–1.05 | Dead neutral zone — no edge |
-| Straddle rising sharply | High volatility event incoming — unpredictable |
-
----
-
-## 🔧 Transition Signals — When Signals Change
-
-| Transition | Meaning | Action |
-|------------|---------|--------|
-| **SB → LB** | Bears failed, bulls taking over | Strong buy signal! |
-| **LB → SB** | Bulls failed, bears taking over | Strong sell signal! |
-| **SB → SC** | Shorts getting trapped, covering begins | Wait — don't chase the bounce |
-| **LB → LU** | Longs getting trapped, unwinding begins | Wait — don't chase the fall |
-| **SC → LB** | Short covering converting to fresh buying | Strong bullish confirmation! |
-| **LU → SB** | Long unwinding converting to fresh shorting | Strong bearish confirmation! |
-| **SC → SB** | Fake rally over, fresh shorts entering | Very bearish! Sell aggressively |
-| **LU → LB** | Fake fall over, fresh longs entering | Very bullish! Buy aggressively |
+| Highlight | Condition | Meaning |
+|-----------|-----------|---------|
+| **Green row** (left border) | Call OI negative for 3+ consecutive rows AND Put OI positive | Bullish: calls being unwound while puts added |
+| **Red row** (left border) | Put OI negative for 3+ consecutive rows AND Call OI positive | Bearish: puts being unwound while calls added |
 
 ---
 
@@ -349,7 +257,7 @@ All of these should be true simultaneously:
 
 ---
 
-## 🔧 Range Filter
+## 🔍 Range Filter
 
 | Setting | Meaning |
 |---------|---------|
@@ -359,7 +267,16 @@ All of these should be true simultaneously:
 
 **How it works**: If ATM = 24,000 and Range = 10, strike interval = 50:
 - Includes strikes from 24,000 - (10×50) = 23,500 to 24,000 + (10×50) = 24,500
-- All OI totals, PCR, PE-CE diff are recalculated using ONLY these filtered strikes
+- All OI totals, volumes, PCR, PE-CE diff are recalculated using ONLY these filtered strikes
+
+---
+
+## 🔄 ATM Modes
+
+| Mode | Behavior |
+|------|----------|
+| **Auto ATM** (default) | Uses the latest Futures LTP to compute ATM, applies same ATM to all rows |
+| **Fixed** | Each row uses its own ATM computed from its own Futures LTP at capture time |
 
 ---
 
@@ -368,7 +285,7 @@ All of these should be true simultaneously:
 The app also computes these using the **Black-Scholes model** (for each strike):
 
 | Greek | What It Measures | Formula Used |
-|-------|-----------------|--------------|
+|-------|--------------------|--------------|
 | **IV** (Implied Volatility) | Market's expectation of future price movement | Newton-Raphson solver on Black-Scholes equation |
 | **Delta** | How much option price moves per ₹1 move in NIFTY | N(d1) for calls, N(d1)-1 for puts |
 | **Gamma** | Rate of change of Delta | n(d1) / (S × σ × √T) |
@@ -388,12 +305,14 @@ The app also computes these using the **Black-Scholes model** (for each strike):
 | timestamp | TIMESTAMPTZ | When snapshot was taken |
 | underlying_price | FLOAT | NIFTY spot price |
 | total_ce_oi / total_pe_oi | BIGINT | Aggregate OI totals |
+| total_ce_volume / total_pe_volume | BIGINT | Aggregate volume totals |
 | pe_ce_oi_diff | BIGINT | PE OI minus CE OI |
 | pcr | FLOAT | Put-Call Ratio |
 | future_ltp | FLOAT | Futures LTP |
 | straddle_price | FLOAT | ATM CE + ATM PE |
 | atm_strike | FLOAT | Current ATM strike |
 | atm_ce_ltp / atm_pe_ltp | FLOAT | ATM option prices |
+| futures_oi | BIGINT | NIFTY Futures OI |
 
 ### Table: `oi_snapshots` (1 row per strike per minute)
 
@@ -402,6 +321,7 @@ The app also computes these using the **Black-Scholes model** (for each strike):
 | strike | FLOAT | Strike price (e.g. 24000) |
 | ce_oi / pe_oi | BIGINT | OI at this strike |
 | ce_chg_oi / pe_chg_oi | BIGINT | OI change vs prev day |
+| ce_volume / pe_volume | BIGINT | Trading volume at this strike |
 | ce_ltp / pe_ltp | FLOAT | Option prices |
 | ce_iv / pe_iv | FLOAT | Implied Volatility |
 | ce_delta through ce_vega | FLOAT | Greeks |
@@ -436,6 +356,7 @@ python run.py
 trader/
 ├── run.py              # Main entry point — starts server + data logger
 ├── config.py           # Environment variables + market constants
+├── claude.md           # This documentation file
 ├── core/
 │   ├── market_data.py  # Multi-tier data fetching (Angel One/yfinance/mock)
 │   ├── option_chain.py # OI analysis engine (Max Pain, Support/Resistance)
@@ -443,12 +364,12 @@ trader/
 │   └── instruments.py  # Instrument token mapping
 ├── web/
 │   ├── app.py          # FastAPI app initialization
-│   ├── api_routes.py   # All REST API endpoints
+│   ├── api_routes.py   # All REST API endpoints + CSV download
 │   ├── templates/
 │   │   └── index.html  # Dashboard HTML
 │   └── static/
-│       ├── css/style.css
-│       └── js/app.js   # Frontend JavaScript
+│       ├── css/style.css  # Styling + info popup + download button
+│       └── js/app.js      # Frontend JavaScript + column info system
 ├── database/
 │   └── __init__.py
 ├── data/cache/         # Cached instrument data
@@ -457,17 +378,27 @@ trader/
 
 ---
 
+## 🔧 API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/oi-table` | GET | Main OI table data (live + historical) |
+| `/api/download-oi` | GET | Download OI table as CSV |
+| `/api/oi-chart` | GET | Chart data for Smart OI tab |
+| `/api/candles` | GET | OHLC candlestick data |
+| `/api/price-vs-oi` | GET | Strike-level price vs OI data |
+| `/api/strikes` | GET | Available strikes list |
+| `/api/market-status` | GET | Is market open/closed |
+| `/api/expiry-info` | GET | Current expiry label |
+| `/api/historical-dates` | GET | Available historical dates |
+| `/api/historical-chart` | GET | Historical chart data |
+
+---
+
 ## 🔑 Quick Reference Cheat Sheet
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
-║                    SIGNAL CHEAT SHEET                        ║
-╠══════════════════════════════════════════════════════════════╣
-║  LB (Long Buildup)    = Price ↑ + OI ↑ = STRONG BULLISH    ║
-║  SB (Short Buildup)   = Price ↓ + OI ↑ = STRONG BEARISH    ║
-║  SC (Short Covering)  = Price ↑ + OI ↓ = WEAK BULLISH      ║
-║  LU (Long Unwinding)  = Price ↓ + OI ↓ = WEAK BEARISH      ║
-╠══════════════════════════════════════════════════════════════╣
 ║                    PCR CHEAT SHEET                           ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  PCR > 1.2  = Extremely Bullish (or reversal warning)       ║
@@ -475,13 +406,39 @@ trader/
 ║  PCR 0.7-0.9 = Bearish                                      ║
 ║  PCR < 0.7  = Extremely Bearish (or reversal warning)       ║
 ╠══════════════════════════════════════════════════════════════╣
+║                    PE-CE OI GUIDE                            ║
+╠══════════════════════════════════════════════════════════════╣
+║  PE-CE Positive & Rising  = Bullish support building        ║
+║  PE-CE Negative & Falling = Bearish pressure building       ║
+║  PE-CE Change Positive    = Sentiment shifting bullish      ║
+║  PE-CE Change Negative    = Sentiment shifting bearish      ║
+╠══════════════════════════════════════════════════════════════╣
 ║                BEST TRADING TIMES                            ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  10:00 - 11:30 AM = PRIMARY window (institutional flow)     ║
 ║  1:30 - 2:30 PM   = SECONDARY window (afternoon adjustment) ║
-║  AVOID: 9:15-9:30, 3:15-3:30, and when signal = S          ║
+║  AVOID: 9:15-9:30, 3:15-3:30                               ║
+╠══════════════════════════════════════════════════════════════╣
+║                TABLE COLUMNS (11-13)                         ║
+╠══════════════════════════════════════════════════════════════╣
+║  Time | Put OI | Call OI | PE-CE OI | PCR                   ║
+║  CE Vol | PE Vol | Total OI                                  ║
 ╚══════════════════════════════════════════════════════════════╝
 ```
+
+---
+
+## 📝 Key Architecture Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **Ranged OI aggregation** | OI is re-summed from per-strike data for the selected ATM ± Range, matching StockMojo's approach |
+| **Auto ATM from Futures LTP** | Uses latest Futures price (not spot) for ATM computation, matching institutional standards |
+| **Previous day closing OI** | "Chg (Day)" compares against the last snapshot of the previous trading day |
+| **Per-strike DB storage** | Enables re-aggregation with different ranges in historical mode |
+| **Volume per-strike storage** | CE/PE volume saved per-strike in `oi_snapshots`, enabling ranged volume in historical mode |
+| **Expiry handling** | Compares expiry dates against `today.date()` (midnight-normalized) to include same-day expiries |
+| **CSV uses same API** | Download endpoint reuses `get_oi_table()` — guaranteed data consistency |
 
 ---
 
