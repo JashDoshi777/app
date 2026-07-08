@@ -15,7 +15,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     initTabs();initTimeframeButtons();initModeButtons();initFilters();initDisplayMode();initATMMode();initDownload();
     startClock();checkMarketStatus();loadExpiryInfo();
     loadAllData();
-    setInterval(()=>{if(currentMode==='live')loadAllData();},60000);
+    setInterval(()=>{if(currentMode==='live')loadAllData();},30000);
     setInterval(checkMarketStatus,10000);
 });
 
@@ -122,6 +122,7 @@ const COL_INFO = {
     pe_ce_oi: {t:'PE-CE OI', d:'Difference between Put OI and Call OI.\nFormula: Put OI − Call OI\n\n• Positive = More Puts than Calls → Bullish support\n• Negative = More Calls than Puts → Bearish pressure\n\nUsed to gauge net market sentiment.'},
     pe_ce_total: {t:'PE-CE OI → Total', d:'Current PE-CE OI difference value.\n\nFormula: Total Put OI − Total Call OI\n(for strikes within ATM ± Range)'},
     pe_ce_change: {t:'PE-CE OI → Change', d:'Change in PE-CE difference from the previous row.\n\n• Positive = Sentiment shifting bullish (more puts or fewer calls)\n• Negative = Sentiment shifting bearish (more calls or fewer puts)\n\nMatches StockMojo\'s "Change" column in PE-CE OI.'},
+    pe_ce_chg_pct: {t:'PE-CE OI → Chg %', d:'Percentage change in PE-CE OI difference vs the previous row.\n\nFormula: (Change ÷ |Previous Total|) × 100\n\nShows relative magnitude of the shift — a large Chg % on a small total is more significant than a small Chg % on a large total.'},
     pcr: {t:'PCR (Put-Call Ratio)', d:'Put-Call Ratio = Total Put OI ÷ Total Call OI\n\n• Above 1.0 = More puts → Bullish support\n• 0.7 – 1.0 = Neutral zone\n• Below 0.7 = More calls → Bearish\n• Extreme values (>1.3 or <0.5) may signal reversals'},
     ce_vol: {t:'CE Volume', d:'Total Call option trading volume across all strikes in the selected range.\n\nHigh volume = Active trading/liquidity on the call side.\nVolume shows activity, while OI shows outstanding positions.'},
     pe_vol: {t:'PE Volume', d:'Total Put option trading volume across all strikes in the selected range.\n\nHigh volume = Active trading/liquidity on the put side.\nVolume shows activity, while OI shows outstanding positions.'},
@@ -155,11 +156,7 @@ function buildTableHeader(){
         h1+=`<th colspan="2" class="col-group put-header">Put OI ${_i('put_oi')}</th>`;
         h1+=`<th colspan="2" class="col-group call-header">Call OI ${_i('call_oi')}</th>`;
     }
-    h1+=`<th colspan="2" class="col-group diff-header">PE-CE OI ${_i('pe_ce_oi')}</th>`;
-    h1+=`<th rowspan="2" class="col-pcr">PCR ${_i('pcr')}</th>`;
-    h1+=`<th rowspan="2" style="color:#26a69a">CE Vol ${_i('ce_vol')}</th>`;
-    h1+=`<th rowspan="2" style="color:#ef5350">PE Vol ${_i('pe_vol')}</th>`;
-    h1+=`<th rowspan="2">Total OI ${_i('total_oi')}</th>`;
+    h1+=`<th colspan="3" class="col-group diff-header">PE-CE OI ${_i('pe_ce_oi')}</th>`;
     // Sub headers
     if(dm==='total'){
         h2+=`<th class="sub">Total ${_i('put_total')}</th><th class="sub">Change ${_i('put_change')}</th>`;
@@ -171,7 +168,7 @@ function buildTableHeader(){
         h2+=`<th class="sub">Total ${_i('put_total')}</th><th class="sub">Chg (Day) ${_i('put_chg_day')}</th><th class="sub">Change ${_i('put_change')}</th>`;
         h2+=`<th class="sub">Total ${_i('call_total')}</th><th class="sub">Chg (Day) ${_i('call_chg_day')}</th><th class="sub">Change ${_i('call_change')}</th>`;
     }
-    h2+=`<th class="sub">Total ${_i('pe_ce_total')}</th><th class="sub">Change ${_i('pe_ce_change')}</th>`;
+    h2+=`<th class="sub">Total ${_i('pe_ce_total')}</th><th class="sub">Change ${_i('pe_ce_change')}</th><th class="sub">Chg % ${_i('pe_ce_chg_pct')}</th>`;
     thead.innerHTML=`<tr>${h1}</tr><tr>${h2}</tr>`;
 }
 
@@ -186,7 +183,7 @@ async function loadOITable(){
         if(rd&&data.range_display)rd.textContent=data.range_display;
         buildTableHeader();
         if(!data.rows||!data.rows.length){
-            document.getElementById('oi-table-body').innerHTML='<tr><td colspan="14" class="empty-msg">No data available</td></tr>';return;
+            document.getElementById('oi-table-body').innerHTML='<tr><td colspan="9" class="empty-msg">No data available</td></tr>';return;
         }
         const raw0=data.rows[0]._raw;
         if(raw0)document.getElementById('underlying-price').textContent=raw0.underlying?.toFixed(2)||'--';
@@ -265,10 +262,10 @@ async function loadOITable(){
             }
             cols+=`<td class="${raw.pe_ce_diff>0?'pe-ce-pos':'pe-ce-neg'}">${r.pe_ce_total}</td>`;
             cols+=`<td class="${vc(raw.pe_ce_diff_change)}">${r.pe_ce_change}</td>`;
-            cols+=`<td>${r.pcr?.toFixed(2)}</td>`;
-            cols+=`<td class="val-neutral">${r.ce_volume||'0'}</td>`;
-            cols+=`<td class="val-neutral">${r.pe_volume||'0'}</td>`;
-            cols+=`<td class="val-neutral">${r.total_oi||'--'}</td>`;
+            const prevPeCe = (raw.pe_ce_diff||0) - (raw.pe_ce_diff_change||0);
+            const absPrev = Math.abs(prevPeCe);
+            const peCePct = absPrev >= 1000 ? Math.max(-999.99, Math.min(999.99, (raw.pe_ce_diff_change / absPrev) * 100)).toFixed(2) : '0.00';
+            cols+=`<td class="${vc(raw.pe_ce_diff_change)}">${peCePct}%</td>`;
             return `<tr class="${rowCls}">${cols}</tr>`;
         }).join('');
     }catch(e){console.error('OI Table:',e);}

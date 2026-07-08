@@ -96,7 +96,13 @@ def data_logger_loop(state):
             now_ist = datetime.now(IST)
 
             if not is_market_open():
-                time.sleep(30)
+                # Poll frequently near market open (within 90s of 9:15)
+                market_open_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+                secs_to_open = (market_open_time - now_ist).total_seconds()
+                if 0 < secs_to_open <= 90:
+                    time.sleep(5)  # Warm-up: check every 5s
+                else:
+                    time.sleep(30)
                 continue
 
             # ── Auto-reconnect Angel One if too many failures ──
@@ -116,8 +122,12 @@ def data_logger_loop(state):
             if chain_df is None or chain_df.empty or underlying <= 0:
                 consecutive_failures += 1
                 data_buffer["errors"] += 1
-                logger.warning("No data received (attempt %d) - retrying in 30s", consecutive_failures)
-                time.sleep(30)
+                # Retry faster during early market hours (first 5 minutes)
+                market_open_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+                minutes_into_session = (now_ist - market_open_time).total_seconds() / 60
+                retry_delay = 10 if minutes_into_session < 5 else 30
+                logger.warning("No data received (attempt %d) - retrying in %ds", consecutive_failures, retry_delay)
+                time.sleep(retry_delay)
                 continue
 
             consecutive_failures = 0  # Reset on success
@@ -132,6 +142,8 @@ def data_logger_loop(state):
             total_pe_vol = int(chain_df["pe_volume"].sum())
             pe_ce_diff = total_pe_oi - total_ce_oi
             pe_ce_diff_change = pe_ce_diff - data_buffer["prev_pe_ce_diff"]
+            _prev_pe_ce = abs(data_buffer["prev_pe_ce_diff"])
+            pe_ce_diff_change_pct = round(max(-999.99, min(999.99, (pe_ce_diff_change / _prev_pe_ce) * 100)), 2) if _prev_pe_ce >= 1000 else 0.0
             pcr = round(total_pe_oi / max(total_ce_oi, 1), 4)
 
             # Future LTP — compute FIRST (needed for accurate ATM)
@@ -188,6 +200,7 @@ def data_logger_loop(state):
                 "ce_oi_change": total_ce_oi - data_buffer["prev_total_ce_oi"] if data_buffer["prev_total_ce_oi"] > 0 else 0,
                 "pe_ce_diff": pe_ce_diff,
                 "pe_ce_diff_change": pe_ce_diff_change,
+                "pe_ce_diff_change_pct": pe_ce_diff_change_pct,
                 "pcr": pcr,
                 "future_ltp": future_ltp,
                 "futures_oi": futures_oi,
@@ -253,7 +266,13 @@ def data_logger_loop(state):
                 data_buffer["data_source"]
             )
 
-            time.sleep(60)
+            # ── Align to next minute boundary ────────────
+            # Instead of fixed 60s sleep, target :05 of the next minute
+            # so data points are evenly spaced at each minute mark.
+            now_after = datetime.now(IST)
+            next_min = (now_after + timedelta(minutes=1)).replace(second=5, microsecond=0)
+            sleep_secs = (next_min - datetime.now(IST)).total_seconds()
+            time.sleep(max(10, min(65, sleep_secs)))
 
         except Exception as e:
             data_buffer["errors"] += 1
@@ -326,18 +345,19 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
     try:
         # Insert market snapshot
         futures_oi = snapshot.get("futures_oi", 0)
+        pe_ce_diff_change_pct = snapshot.get("pe_ce_diff_change_pct", 0.0)
         cur.execute("""
             INSERT INTO market_snapshots
             (timestamp, symbol, underlying_price, open, high, low, close, volume,
              total_ce_oi, total_pe_oi, total_ce_volume, total_pe_volume,
-             pe_ce_oi_diff, pe_ce_oi_diff_change, pcr,
+             pe_ce_oi_diff, pe_ce_oi_diff_change, pe_ce_oi_diff_change_pct, pcr,
              future_ltp, future_oi_change, atm_strike, atm_ce_ltp, atm_pe_ltp, straddle_price, futures_oi)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             timestamp, "NIFTY", underlying, underlying, underlying, underlying, underlying,
             total_ce_vol + total_pe_vol,
             total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol,
-            pe_ce_diff, pe_ce_diff_change, pcr,
+            pe_ce_diff, pe_ce_diff_change, pe_ce_diff_change_pct, pcr,
             future_ltp, 0, atm, atm_ce_ltp, atm_pe_ltp, straddle, futures_oi
         ))
 
@@ -401,6 +421,7 @@ def init_database_sync():
                 total_ce_oi BIGINT DEFAULT 0, total_pe_oi BIGINT DEFAULT 0,
                 total_ce_volume BIGINT DEFAULT 0, total_pe_volume BIGINT DEFAULT 0,
                 pe_ce_oi_diff BIGINT DEFAULT 0, pe_ce_oi_diff_change BIGINT DEFAULT 0,
+                pe_ce_oi_diff_change_pct FLOAT DEFAULT 0,
                 pcr FLOAT DEFAULT 0,
                 future_ltp FLOAT DEFAULT 0, future_oi_change BIGINT DEFAULT 0,
                 atm_strike FLOAT DEFAULT 0, atm_ce_ltp FLOAT DEFAULT 0,
@@ -446,6 +467,43 @@ def init_database_sync():
             cur2.close()
         except Exception:
             conn.rollback()  # Column might already exist
+
+        # Migration: add pe_ce_oi_diff_change_pct column + backfill historical data
+        try:
+            cur3 = conn.cursor()
+            cur3.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS pe_ce_oi_diff_change_pct FLOAT DEFAULT 0;")
+            conn.commit()
+            # Backfill: use LAG() to compute from actual previous row (handles server restarts)
+            cur3.execute("""
+                UPDATE market_snapshots ms
+                SET pe_ce_oi_diff_change_pct = sub.pct
+                FROM (
+                    SELECT id,
+                        CASE
+                            WHEN prev_diff IS NOT NULL AND ABS(prev_diff) >= 1000
+                            THEN GREATEST(-999.99, LEAST(999.99,
+                                 ROUND(((pe_ce_oi_diff - prev_diff)::numeric / ABS(prev_diff)) * 100, 2)::float
+                            ))
+                            ELSE 0
+                        END as pct
+                    FROM (
+                        SELECT id, pe_ce_oi_diff,
+                               LAG(pe_ce_oi_diff) OVER (
+                                   PARTITION BY symbol, DATE(timestamp AT TIME ZONE 'Asia/Kolkata')
+                                   ORDER BY timestamp
+                               ) as prev_diff
+                        FROM market_snapshots
+                    ) inner_q
+                ) sub
+                WHERE ms.id = sub.id;
+            """)
+            conn.commit()
+            cur3.close()
+            logger.info("[OK] pe_ce_oi_diff_change_pct column ready + historical data backfilled.")
+        except Exception as e:
+            conn.rollback()
+            logger.debug("pe_ce_oi_diff_change_pct migration: %s", e)
+
         cur.close()
         conn.close()
         logger.info("[OK] Database tables ready.")
