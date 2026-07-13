@@ -412,6 +412,25 @@ html, body {
     font-weight: 600;
 }
 
+/* ═══ STICKY TIME COLUMN (frozen on horizontal scroll) ═══ */
+.oi-table th.col-time,
+.oi-table td.col-time {
+    position: sticky;
+    left: 0;
+    z-index: 5;
+    background: var(--surface2);
+}
+/* Header time cell: sticky in BOTH directions (top + left) */
+.oi-table th.col-time {
+    z-index: 15;
+}
+.oi-table td.col-time {
+    background: var(--bg);
+}
+.oi-table tbody tr:hover td.col-time {
+    background: rgba(20, 22, 32, 0.95);
+}
+
 .empty-msg { color: var(--text-muted); padding: 40px !important; font-size: 13px; }
 
 /* ═══ ATM MODE TOGGLE ═══ */

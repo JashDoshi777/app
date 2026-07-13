@@ -118,6 +118,9 @@ def _filter_by_timeframe(rows, tf):
     Takes a chronological list (oldest→newest). For each time window,
     picks the LAST row in that window (most complete data).
     Returns label time as the window boundary (e.g., 9:30 for 9:30-9:44 window).
+
+    IMPORTANT: The most recent (live) row ALWAYS keeps its actual timestamp
+    so the UI shows it as current/live data, not relabeled to a past window.
     """
     if tf <= 1 or len(rows) <= 1:
         return rows
@@ -159,9 +162,15 @@ def _filter_by_timeframe(rows, tf):
     # Sort by window start time and relabel timestamps to window START
     # StockMojo labels windows as: 09:15, 09:30, 09:45 (start of each window)
     result = []
-    for w_start in sorted(windows.keys()):
+    sorted_windows = sorted(windows.keys())
+    for i, w_start in enumerate(sorted_windows):
         row = dict(windows[w_start])  # copy
-        row["timestamp"] = _format_hhmm(w_start)
+        if i == len(sorted_windows) - 1:
+            # LAST window (live/current): keep the ACTUAL timestamp
+            # so the UI shows it as current live data, not a past window label
+            pass
+        else:
+            row["timestamp"] = _format_hhmm(w_start)
         result.append(row)
 
     return result
@@ -284,6 +293,11 @@ async def get_oi_table(
 
     # STEP 1: Reverse to chronological order (oldest→newest)
     chrono = list(reversed(oi_table_raw))
+
+    # STEP 1.5: Filter to TODAY's data only (deque may contain previous day's rows)
+    # Without this, tf>1 shows yesterday's afternoon data mixed with today's live data
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    chrono = [r for r in chrono if r.get("timestamp_full", "").startswith(today_str)]
 
     # STEP 2: Apply proper time-window filtering BEFORE computing deltas
     # This ensures 15m filter shows 9:30, 9:45, 10:00, etc.
@@ -487,15 +501,26 @@ async def download_oi_csv(
     writer.writerow([
         "Time", "Put OI Total", "Put OI Chg(Day)", "Put OI Change",
         "Call OI Total", "Call OI Chg(Day)", "Call OI Change",
-        "PE-CE OI", "PE-CE Change", "PCR",
+        "PE-CE OI", "PE-CE Change", "PE-CE Chg %", "PCR",
         "CE Volume", "PE Volume", "Total OI"
     ])
     for r in rows:
+        # Compute Change % from raw data
+        raw = r.get("_raw", {})
+        pe_ce_diff = raw.get("pe_ce_diff", 0) or 0
+        pe_ce_diff_change = raw.get("pe_ce_diff_change", 0) or 0
+        prev_pe_ce = pe_ce_diff - pe_ce_diff_change
+        abs_prev = abs(prev_pe_ce)
+        if abs_prev >= 1000:
+            chg_pct = max(-999.99, min(999.99, (pe_ce_diff_change / abs_prev) * 100))
+            chg_pct_str = f"{chg_pct:.2f}%"
+        else:
+            chg_pct_str = "0.00%"
         writer.writerow([
             r.get("time", ""),
             r.get("pe_oi_total", ""), r.get("pe_oi_change_day", ""), r.get("pe_oi_change", ""),
             r.get("ce_oi_total", ""), r.get("ce_oi_change_day", ""), r.get("ce_oi_change", ""),
-            r.get("pe_ce_total", ""), r.get("pe_ce_change", ""), r.get("pcr", ""),
+            r.get("pe_ce_total", ""), r.get("pe_ce_change", ""), chg_pct_str, r.get("pcr", ""),
             r.get("ce_volume", ""), r.get("pe_volume", ""), r.get("total_oi", ""),
         ])
 
