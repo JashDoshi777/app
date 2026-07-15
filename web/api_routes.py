@@ -567,6 +567,60 @@ async def download_oi_csv(
     )
 
 
+@router.get("/download-oi-md")
+async def download_oi_md(
+    tf: int = Query(1),
+    range_strikes: int = Query(5),
+    auto_atm: bool = Query(True),
+    mode: str = Query("live"),
+    date: str = Query(""),
+):
+    """Download OI table data as a structured Markdown file (same data as CSV/table)."""
+    data = await get_oi_table(tf=tf, range_strikes=range_strikes, auto_atm=auto_atm, mode=mode, date=date)
+    rows = data.get("rows", []) if isinstance(data, dict) else []
+    range_display = data.get("range_display", "") if isinstance(data, dict) else ""
+
+    report_date = date or datetime.now(IST).strftime("%Y-%m-%d")
+    tf_label = f"{tf}m"
+    mode_label = "Historical" if mode == "historical" and date else "Live"
+
+    lines = []
+    lines.append(f"# NIFTY OI Report — {report_date}")
+    lines.append("")
+    lines.append(f"- **Mode:** {mode_label}")
+    lines.append(f"- **Timeframe:** {tf_label}")
+    lines.append(f"- **Strike Range:** {range_display or f'ATM ± {range_strikes}'}")
+    lines.append(f"- **Generated:** {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')} IST")
+    lines.append(f"- **Rows:** {len(rows)}")
+    lines.append("")
+
+    if not rows:
+        lines.append("_No data available for this selection._")
+    else:
+        lines.append("| Time | Put OI Total | Put OI Chg(Day) | Put OI Change | Put Avg(10m) | Put Ratio | "
+                      "Call OI Total | Call OI Chg(Day) | Call OI Change | Call Avg(10m) | Call Ratio | "
+                      "PE-CE OI | PE-CE Change | PCR | CE Volume | PE Volume | Total OI |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for r in rows:
+            lines.append(
+                f"| {r.get('time', '')} "
+                f"| {r.get('pe_oi_total', '')} | {r.get('pe_oi_change_day', '')} | {r.get('pe_oi_change', '')} "
+                f"| {r.get('pe_change_avg', '--')} | {r.get('pe_change_ratio', '--')} "
+                f"| {r.get('ce_oi_total', '')} | {r.get('ce_oi_change_day', '')} | {r.get('ce_oi_change', '')} "
+                f"| {r.get('ce_change_avg', '--')} | {r.get('ce_change_ratio', '--')} "
+                f"| {r.get('pe_ce_total', '')} | {r.get('pe_ce_change', '')} | {r.get('pcr', '')} "
+                f"| {r.get('ce_volume', '')} | {r.get('pe_volume', '')} | {r.get('total_oi', '')} |"
+            )
+
+    content = "\n".join(lines) + "\n"
+    filename = f"NIFTY_OI_{report_date}_{tf}m.md"
+    return Response(
+        content=content,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
 def _compute_signal_from_data(cur_price, prev_price, cur_total_oi, prev_total_oi):
     """Compute LB/SB/SC/LU signal from price + OI direction between two snapshots."""
     if prev_price <= 0 or prev_total_oi <= 0:

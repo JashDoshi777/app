@@ -324,10 +324,17 @@ function renderStraddle(data){const ctx=document.getElementById('chart-straddle'
 function dualOpts(lbl,rbl){return{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},hover:{mode:'index',intersect:false},plugins:{tooltip:{enabled:true,backgroundColor:'rgba(20,22,32,0.95)',borderColor:'rgba(255,255,255,0.1)',borderWidth:1,titleFont:{weight:'600'},bodyFont:{size:12},padding:10,callbacks:{label:c=>c.datasetIndex===0?`OI: ${fmtL(c.raw)}`:`Price: ₹${c.raw?.toFixed(2)}`}}},scales:{x:{grid:{display:false},ticks:{maxTicksLimit:10}},y:{position:'left',grid:{color:'rgba(255,255,255,0.03)'},ticks:{callback:v=>fmtL(v)},title:{display:true,text:lbl,color:'rgba(255,255,255,0.3)'}},y1:{position:'right',grid:{display:false},ticks:{callback:v=>'₹'+v.toFixed(0)},title:{display:true,text:rbl,color:'rgba(255,255,255,0.3)'}}}};}
 function fmtL(n){if(n===null||n===undefined)return'--';const a=Math.abs(n);if(a>=1e7)return(n/1e7).toFixed(1)+' Cr';if(a>=1e5)return(n/1e5).toFixed(1)+' L';if(a>=1e3)return(n/1e3).toFixed(1)+' K';return n.toString();}
 
-/* ═══ CSV DOWNLOAD ═══ */
+/* ═══ CSV / MD DOWNLOAD ═══ */
 function initDownload(){
     const btn=document.getElementById('download-csv-btn');
     if(btn)btn.addEventListener('click',downloadCSV);
+    const mdBtn=document.getElementById('download-md-btn');
+    if(mdBtn)mdBtn.addEventListener('click',downloadMD);
+}
+function _triggerDownload(url){
+    const a=document.createElement('a');
+    a.href=url;a.download='';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
 }
 function downloadCSV(){
     const rng=document.getElementById('strike-range');const range=rng?rng.value:5;
@@ -335,8 +342,13 @@ function downloadCSV(){
     if(currentMode==='historical'&&historicalDate){
         url+=`&mode=historical&date=${historicalDate}`;
     }
-    // Trigger download via hidden link
-    const a=document.createElement('a');
-    a.href=url;a.download='';
-    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    _triggerDownload(url);
+}
+function downloadMD(){
+    const rng=document.getElementById('strike-range');const range=rng?rng.value:5;
+    let url=`/api/download-oi-md?tf=${currentTf}&range_strikes=${range}&auto_atm=${autoATM}`;
+    if(currentMode==='historical'&&historicalDate){
+        url+=`&mode=historical&date=${historicalDate}`;
+    }
+    _triggerDownload(url);
 }
