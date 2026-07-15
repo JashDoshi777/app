@@ -475,6 +475,49 @@ async def get_oi_table(
             },
         })
 
+    # STEP 4.5: Rolling 10-row average of Change, and ratio vs previous row's average.
+    # Row 0 (9:15) is always excluded — its Change is a placeholder 0, not real data.
+    # Rows 1-9 (9:16-9:24) stay blank — not enough rows for a full window yet.
+    # From row 10 (9:25) onward: Avg = trailing average of rows [_i-9 .. _i] (window excludes row 0).
+    # From row 11 (9:26) onward: Ratio = this row's own Change ÷ the Avg from the row before it.
+    _window = 10
+    _pe_avgs = {}  # row idx -> rolling avg (only for idx >= _window)
+    _ce_avgs = {}
+    for _i in range(_window, len(formatted)):
+        _pe_changes = [formatted[_j]["_raw"]["pe_oi_change"] for _j in range(_i - _window + 1, _i + 1)]
+        _ce_changes = [formatted[_j]["_raw"]["ce_oi_change"] for _j in range(_i - _window + 1, _i + 1)]
+        _pe_avgs[_i] = sum(_pe_changes) / _window
+        _ce_avgs[_i] = sum(_ce_changes) / _window
+
+    for _i, _f in enumerate(formatted):
+        if _i in _pe_avgs:
+            _f["pe_change_avg"] = _fmt_lakh(round(_pe_avgs[_i]))
+            _f["ce_change_avg"] = _fmt_lakh(round(_ce_avgs[_i]))
+            _f["_raw"]["pe_change_avg"] = round(_pe_avgs[_i], 2)
+            _f["_raw"]["ce_change_avg"] = round(_ce_avgs[_i], 2)
+        else:
+            _f["pe_change_avg"] = "--"
+            _f["ce_change_avg"] = "--"
+            _f["_raw"]["pe_change_avg"] = 0
+            _f["_raw"]["ce_change_avg"] = 0
+
+        _prev_i = _i - 1
+        if _prev_i in _pe_avgs:
+            _ppa, _pca = _pe_avgs[_prev_i], _ce_avgs[_prev_i]
+            _pr = round(_f["_raw"]["pe_oi_change"] / _ppa, 1) if abs(_ppa) > 100 else 0
+            _cr = round(_f["_raw"]["ce_oi_change"] / _pca, 1) if abs(_pca) > 100 else 0
+        else:
+            _ppa = _pca = 0
+            _pr = 0
+            _cr = 0
+        _f["pe_change_ratio"] = f"{_pr:.1f}X" if _pr != 0 else "--"
+        _f["ce_change_ratio"] = f"{_cr:.1f}X" if _cr != 0 else "--"
+        _f["_raw"]["pe_change_ratio"] = _pr
+        _f["_raw"]["ce_change_ratio"] = _cr
+        # Highlight eligibility: previous row's avg must be at least 1 lakh (L/Cr), not K — avoids noisy K-scale ratios
+        _f["_raw"]["pe_ratio_highlight_ok"] = abs(_ppa) >= 100000
+        _f["_raw"]["ce_ratio_highlight_ok"] = abs(_pca) >= 100000
+
     # Reverse to newest-first for UI display
     formatted.reverse()
 
@@ -499,28 +542,20 @@ async def download_oi_csv(
     writer = csv.writer(output)
     # Header
     writer.writerow([
-        "Time", "Put OI Total", "Put OI Chg(Day)", "Put OI Change",
-        "Call OI Total", "Call OI Chg(Day)", "Call OI Change",
-        "PE-CE OI", "PE-CE Change", "PE-CE Chg %", "PCR",
+        "Time",
+        "Put OI Total", "Put OI Chg(Day)", "Put OI Change", "Put Avg(10m)", "Put Ratio",
+        "Call OI Total", "Call OI Chg(Day)", "Call OI Change", "Call Avg(10m)", "Call Ratio",
+        "PE-CE OI", "PE-CE Change", "PCR",
         "CE Volume", "PE Volume", "Total OI"
     ])
     for r in rows:
-        # Compute Change % from raw data
-        raw = r.get("_raw", {})
-        pe_ce_diff = raw.get("pe_ce_diff", 0) or 0
-        pe_ce_diff_change = raw.get("pe_ce_diff_change", 0) or 0
-        prev_pe_ce = pe_ce_diff - pe_ce_diff_change
-        abs_prev = abs(prev_pe_ce)
-        if abs_prev >= 1000:
-            chg_pct = max(-999.99, min(999.99, (pe_ce_diff_change / abs_prev) * 100))
-            chg_pct_str = f"{chg_pct:.2f}%"
-        else:
-            chg_pct_str = "0.00%"
         writer.writerow([
             r.get("time", ""),
             r.get("pe_oi_total", ""), r.get("pe_oi_change_day", ""), r.get("pe_oi_change", ""),
+            r.get("pe_change_avg", "--"), r.get("pe_change_ratio", "--"),
             r.get("ce_oi_total", ""), r.get("ce_oi_change_day", ""), r.get("ce_oi_change", ""),
-            r.get("pe_ce_total", ""), r.get("pe_ce_change", ""), chg_pct_str, r.get("pcr", ""),
+            r.get("ce_change_avg", "--"), r.get("ce_change_ratio", "--"),
+            r.get("pe_ce_total", ""), r.get("pe_ce_change", ""), r.get("pcr", ""),
             r.get("ce_volume", ""), r.get("pe_volume", ""), r.get("total_oi", ""),
         ])
 
@@ -1297,6 +1332,46 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                     "pe_volume": item.get("pe_vol", 0),
                 },
             })
+
+        # STEP 4: Rolling 10-row average of Change, and ratio vs previous row's average (same as live)
+        # Row 0 is always excluded from windows — its Change is a placeholder 0, not real data.
+        _window = 10
+        _pe_avgs = {}
+        _ce_avgs = {}
+        for _i in range(_window, len(all_rows)):
+            _pe_changes = [all_rows[_j]["_raw"]["pe_oi_change"] for _j in range(_i - _window + 1, _i + 1)]
+            _ce_changes = [all_rows[_j]["_raw"]["ce_oi_change"] for _j in range(_i - _window + 1, _i + 1)]
+            _pe_avgs[_i] = sum(_pe_changes) / _window
+            _ce_avgs[_i] = sum(_ce_changes) / _window
+
+        for _i, _f in enumerate(all_rows):
+            if _i in _pe_avgs:
+                _f["pe_change_avg"] = _fmt_lakh(round(_pe_avgs[_i]))
+                _f["ce_change_avg"] = _fmt_lakh(round(_ce_avgs[_i]))
+                _f["_raw"]["pe_change_avg"] = round(_pe_avgs[_i], 2)
+                _f["_raw"]["ce_change_avg"] = round(_ce_avgs[_i], 2)
+            else:
+                _f["pe_change_avg"] = "--"
+                _f["ce_change_avg"] = "--"
+                _f["_raw"]["pe_change_avg"] = 0
+                _f["_raw"]["ce_change_avg"] = 0
+
+            _prev_i = _i - 1
+            if _prev_i in _pe_avgs:
+                _ppa, _pca = _pe_avgs[_prev_i], _ce_avgs[_prev_i]
+                _pr = round(_f["_raw"]["pe_oi_change"] / _ppa, 1) if abs(_ppa) > 100 else 0
+                _cr = round(_f["_raw"]["ce_oi_change"] / _pca, 1) if abs(_pca) > 100 else 0
+            else:
+                _ppa = _pca = 0
+                _pr = 0
+                _cr = 0
+            _f["pe_change_ratio"] = f"{_pr:.1f}X" if _pr != 0 else "--"
+            _f["ce_change_ratio"] = f"{_cr:.1f}X" if _cr != 0 else "--"
+            _f["_raw"]["pe_change_ratio"] = _pr
+            _f["_raw"]["ce_change_ratio"] = _cr
+            # Highlight eligibility: previous row's avg must be at least 1 lakh (L/Cr), not K
+            _f["_raw"]["pe_ratio_highlight_ok"] = abs(_ppa) >= 100000
+            _f["_raw"]["ce_ratio_highlight_ok"] = abs(_pca) >= 100000
 
         # Reverse to newest-first for display
         all_rows.reverse()

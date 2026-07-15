@@ -150,25 +150,25 @@ function buildTableHeader(){
     let h1='',h2='';
     h1+=`<th rowspan="2" class="col-time">Time ${_i('time')}</th>`;
     if(dm==='total'||dm==='all'){
-        h1+=`<th colspan="${dm==='all'?3:2}" class="col-group put-header">Put OI ${_i('put_oi')}</th>`;
-        h1+=`<th colspan="${dm==='all'?3:2}" class="col-group call-header">Call OI ${_i('call_oi')}</th>`;
+        h1+=`<th colspan="${dm==='all'?5:4}" class="col-group put-header">Put OI ${_i('put_oi')}</th>`;
+        h1+=`<th colspan="${dm==='all'?5:4}" class="col-group call-header">Call OI ${_i('call_oi')}</th>`;
     } else {
-        h1+=`<th colspan="2" class="col-group put-header">Put OI ${_i('put_oi')}</th>`;
-        h1+=`<th colspan="2" class="col-group call-header">Call OI ${_i('call_oi')}</th>`;
+        h1+=`<th colspan="4" class="col-group put-header">Put OI ${_i('put_oi')}</th>`;
+        h1+=`<th colspan="4" class="col-group call-header">Call OI ${_i('call_oi')}</th>`;
     }
-    h1+=`<th colspan="3" class="col-group diff-header">PE-CE OI ${_i('pe_ce_oi')}</th>`;
+    h1+=`<th colspan="2" class="col-group diff-header">PE-CE OI ${_i('pe_ce_oi')}</th>`;
     // Sub headers
     if(dm==='total'){
-        h2+=`<th class="sub">Total ${_i('put_total')}</th><th class="sub">Change ${_i('put_change')}</th>`;
-        h2+=`<th class="sub">Total ${_i('call_total')}</th><th class="sub">Change ${_i('call_change')}</th>`;
+        h2+=`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
+        h2+=`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
     } else if(dm==='change'){
-        h2+=`<th class="sub">Chg (Day) ${_i('put_chg_day')}</th><th class="sub">Change ${_i('put_change')}</th>`;
-        h2+=`<th class="sub">Chg (Day) ${_i('call_chg_day')}</th><th class="sub">Change ${_i('call_change')}</th>`;
+        h2+=`<th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
+        h2+=`<th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
     } else {
-        h2+=`<th class="sub">Total ${_i('put_total')}</th><th class="sub">Chg (Day) ${_i('put_chg_day')}</th><th class="sub">Change ${_i('put_change')}</th>`;
-        h2+=`<th class="sub">Total ${_i('call_total')}</th><th class="sub">Chg (Day) ${_i('call_chg_day')}</th><th class="sub">Change ${_i('call_change')}</th>`;
+        h2+=`<th class="sub">Total</th><th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
+        h2+=`<th class="sub">Total</th><th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
     }
-    h2+=`<th class="sub">Total ${_i('pe_ce_total')}</th><th class="sub">Change ${_i('pe_ce_change')}</th><th class="sub">Chg % ${_i('pe_ce_chg_pct')}</th>`;
+    h2+=`<th class="sub">Total</th><th class="sub">Change</th>`;
     thead.innerHTML=`<tr>${h1}</tr><tr>${h2}</tr>`;
 }
 
@@ -223,86 +223,59 @@ function renderOITable(data){
     const dm=currentDisplayMode;
     const rows=data.rows;
 
-    // Pre-compute highlighting:
-    // 3-consecutive negative — track consecutive negative change in OI rows
-    const rowHighlights=[];
-
-    // Rows are newest-first in data. We process in display order (newest first).
-    // For consecutive checking, we need chronological order, so reverse temporarily.
-    const chronoRows=[...rows].reverse();
-
-    // Track consecutive negatives in chronological order
-    let ceNegStreak=0,peNegStreak=0;
-    const ceNegStreakArr=[];
-    const peNegStreakArr=[];
-
-    for(let i=0;i<chronoRows.length;i++){
-        const raw=chronoRows[i]._raw||{};
-        const ceChg=raw.ce_oi_change||0;
-        const peChg=raw.pe_oi_change||0;
-
-        // Track consecutive negatives
-        if(ceChg<0){ceNegStreak++;} else {ceNegStreak=0;}
-        if(peChg<0){peNegStreak++;} else {peNegStreak=0;}
-        ceNegStreakArr.push(ceNegStreak);
-        peNegStreakArr.push(peNegStreak);
-    }
-
-    // Map back to display order (newest-first)
-    const ceStreaks=[...ceNegStreakArr].reverse();
-    const peStreaks=[...peNegStreakArr].reverse();
-
-    for(let i=0;i<rows.length;i++){
-        const raw=rows[i]._raw||{};
-        // Row highlighting: 3 consecutive negative on one side WITH addition on opposite
-        let rowClass='';
-        if(ceStreaks[i]>=3){
-            const peChangePos=(raw.pe_oi_change||0)>0;
-            if(peChangePos)rowClass='row-highlight-green';
-        }
-        if(peStreaks[i]>=3){
-            const ceChangePos=(raw.ce_oi_change||0)>0;
-            if(ceChangePos)rowClass='row-highlight-red';
-        }
-        rowHighlights.push(rowClass);
-    }
-
     const tbody=document.getElementById('oi-table-body');
-    tbody.innerHTML=rows.map((r,i)=>{
+    tbody.innerHTML=rows.map((r)=>{
         const raw=r._raw||{};
         const sig=r.signal||'N/A';const arrow=r.signal_arrow||'';
         const sigClass=sig==='LB'||sig==='SC'?'up':sig==='SB'||sig==='LU'?'down':'side';
-        const rowCls=rowHighlights[i]||'';
+        let rowCls='';
+
+        // Ratio-based highlighting
+        // Only counts when the underlying avg was in L/Cr (>=1 lakh), not K — avoids noisy small-avg spikes
+        const peRatio=raw.pe_ratio_highlight_ok?Math.abs(raw.pe_change_ratio||0):0;
+        const ceRatio=raw.ce_ratio_highlight_ok?Math.abs(raw.ce_change_ratio||0):0;
+        const maxRatio=Math.max(peRatio,ceRatio);
+        if(maxRatio>=4){rowCls='row-highlight-orange';}
+        else if(maxRatio>=2){rowCls='row-highlight-yellow';}
 
         let cols=`<td class="col-time">${r.time}</td>`;
         if(dm==='total'){
             cols+=`<td class="${vc(raw.total_pe_oi)}">${r.pe_oi_total}</td>`;
             cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
+            cols+=`<td class="val-neutral">${r.pe_change_avg||'--'}</td>`;
+            cols+=`<td class="${ratioClass(raw.pe_change_ratio,raw.pe_ratio_highlight_ok)}">${r.pe_change_ratio||'--'}</td>`;
             cols+=`<td class="${vc(raw.total_ce_oi)}">${r.ce_oi_total}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
+            cols+=`<td class="val-neutral">${r.ce_change_avg||'--'}</td>`;
+            cols+=`<td class="${ratioClass(raw.ce_change_ratio,raw.ce_ratio_highlight_ok)}">${r.ce_change_ratio||'--'}</td>`;
         } else if(dm==='change'){
             cols+=`<td class="${vc(raw.pe_oi_change_day)}">${r.pe_oi_change_day}</td>`;
             cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
+            cols+=`<td class="val-neutral">${r.pe_change_avg||'--'}</td>`;
+            cols+=`<td class="${ratioClass(raw.pe_change_ratio,raw.pe_ratio_highlight_ok)}">${r.pe_change_ratio||'--'}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
+            cols+=`<td class="val-neutral">${r.ce_change_avg||'--'}</td>`;
+            cols+=`<td class="${ratioClass(raw.ce_change_ratio,raw.ce_ratio_highlight_ok)}">${r.ce_change_ratio||'--'}</td>`;
         } else {
             cols+=`<td class="${vc(raw.total_pe_oi)}">${r.pe_oi_total}</td>`;
             cols+=`<td class="${vc(raw.pe_oi_change_day)}">${r.pe_oi_change_day}</td>`;
             cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
+            cols+=`<td class="val-neutral">${r.pe_change_avg||'--'}</td>`;
+            cols+=`<td class="${ratioClass(raw.pe_change_ratio,raw.pe_ratio_highlight_ok)}">${r.pe_change_ratio||'--'}</td>`;
             cols+=`<td class="${vc(raw.total_ce_oi)}">${r.ce_oi_total}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
+            cols+=`<td class="val-neutral">${r.ce_change_avg||'--'}</td>`;
+            cols+=`<td class="${ratioClass(raw.ce_change_ratio,raw.ce_ratio_highlight_ok)}">${r.ce_change_ratio||'--'}</td>`;
         }
         cols+=`<td class="${raw.pe_ce_diff>0?'pe-ce-pos':'pe-ce-neg'}">${r.pe_ce_total}</td>`;
         cols+=`<td class="${vc(raw.pe_ce_diff_change)}">${r.pe_ce_change}</td>`;
-        const prevPeCe = (raw.pe_ce_diff||0) - (raw.pe_ce_diff_change||0);
-        const absPrev = Math.abs(prevPeCe);
-        const peCePct = absPrev >= 1000 ? Math.max(-999.99, Math.min(999.99, (raw.pe_ce_diff_change / absPrev) * 100)).toFixed(2) : '0.00';
-        cols+=`<td class="${vc(raw.pe_ce_diff_change)}">${peCePct}%</td>`;
         return `<tr class="${rowCls}">${cols}</tr>`;
     }).join('');
 }
 function vc(v){return(!v||v===0)?'val-neutral':v>0?'val-pos':'val-neg';}
+function ratioClass(v,highlightOk){if(!highlightOk)return'val-neutral';const a=Math.abs(v||0);if(a>=4)return'val-neg';if(a>=2)return'val-pos';return'val-neutral';}
 
 /* ═══ SMART OI CHARTS ═══ */
 async function loadSmartOI(){

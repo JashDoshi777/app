@@ -381,23 +381,23 @@ html, body {
     border-color: #42a5f5;
 }
 
-/* ═══ CONSECUTIVE NEGATIVE ROW HIGHLIGHTS ═══ */
-/* Call OI negative for 3+ rows (bullish direction) — green highlight */
-.row-highlight-green {
-    background: rgba(38, 166, 154, 0.15) !important;
-    border-left: 3px solid var(--green);
+/* ═══ RATIO-BASED ROW HIGHLIGHTS ═══ */
+/* Ratio 2x–4x highlight (yellow) */
+.row-highlight-yellow {
+    background: rgba(255, 238, 88, 0.18) !important;
+    border-left: 3px solid #ffee58;
 }
-.row-highlight-green:hover {
-    background: rgba(38, 166, 154, 0.22) !important;
+.row-highlight-yellow:hover {
+    background: rgba(255, 238, 88, 0.28) !important;
 }
 
-/* Put OI negative for 3+ rows (bearish direction) — red highlight */
-.row-highlight-red {
-    background: rgba(239, 83, 80, 0.15) !important;
-    border-left: 3px solid var(--red);
+/* Ratio ≥4x highlight (orange) */
+.row-highlight-orange {
+    background: rgba(255, 167, 38, 0.20) !important;
+    border-left: 3px solid #ffa726;
 }
-.row-highlight-red:hover {
-    background: rgba(239, 83, 80, 0.22) !important;
+.row-highlight-orange:hover {
+    background: rgba(255, 167, 38, 0.30) !important;
 }
 
 /* ═══ PE-CE OI TOTAL COLUMN — StockMojo Style ═══ */

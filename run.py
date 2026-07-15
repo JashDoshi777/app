@@ -56,7 +56,73 @@ data_buffer = {
     "errors": 0,
     "data_source": "NONE",
     "start_time": datetime.now(IST).isoformat(),
+    # Rolling range=5 (ATM ± 5 strikes) Change history — used to compute
+    # live Avg(10m)/Ratio at range=5, persisted to market_snapshots.
+    "range5_prev_pe_oi": 0,
+    "range5_prev_ce_oi": 0,
+    "range5_pe_chg_history": deque(maxlen=10),
+    "range5_ce_chg_history": deque(maxlen=10),
+    "range5_prev_pe_avg": None,
+    "range5_prev_ce_avg": None,
 }
+
+RANGE5_STRIKES = 5
+
+
+def _compute_range5_totals(chain_df, atm, strike_interval):
+    """Sum PE/CE OI across strikes within ATM ± RANGE5_STRIKES (matches UI's range=5 default)."""
+    if chain_df is None or chain_df.empty or atm <= 0:
+        return 0, 0
+    lo = atm - RANGE5_STRIKES * strike_interval
+    hi = atm + RANGE5_STRIKES * strike_interval
+    filtered = chain_df[(chain_df["strike"] >= lo) & (chain_df["strike"] <= hi)]
+    return int(filtered["pe_oi"].sum()), int(filtered["ce_oi"].sum())
+
+
+def _update_range5_avg_ratio(data_buffer, pe_oi_r5, ce_oi_r5):
+    """
+    Roll the range=5 Change history forward by one row and compute this row's
+    Avg(10m) (trailing avg of last 10 Change values) + Ratio (this row's Change
+    ÷ previous row's Avg) — identical rule to the UI's rolling-window logic.
+    The very first row of the day (no previous OI yet) is NEVER pushed into the
+    window — its Change is a placeholder 0, not real data — so Avg first appears
+    on the row that completes 10 REAL changes (9:25 if the day starts at 9:15),
+    matching the UI's rule exactly.
+    Returns (pe_avg, ce_avg, pe_ratio, ce_ratio) — 0 until enough history exists.
+    """
+    prev_pe_oi = data_buffer["range5_prev_pe_oi"]
+    prev_ce_oi = data_buffer["range5_prev_ce_oi"]
+    is_first_row_of_day = prev_pe_oi <= 0 and prev_ce_oi <= 0
+
+    pe_chg = pe_oi_r5 - prev_pe_oi if prev_pe_oi > 0 else 0
+    ce_chg = ce_oi_r5 - prev_ce_oi if prev_ce_oi > 0 else 0
+
+    pe_hist = data_buffer["range5_pe_chg_history"]
+    ce_hist = data_buffer["range5_ce_chg_history"]
+
+    # Ratio uses the PREVIOUS row's avg (captured before we push this row's change in)
+    prev_pe_avg = data_buffer["range5_prev_pe_avg"]
+    prev_ce_avg = data_buffer["range5_prev_ce_avg"]
+    pe_ratio = round(pe_chg / prev_pe_avg, 1) if prev_pe_avg and abs(prev_pe_avg) > 100 else 0
+    ce_ratio = round(ce_chg / prev_ce_avg, 1) if prev_ce_avg and abs(prev_ce_avg) > 100 else 0
+
+    if not is_first_row_of_day:
+        pe_hist.append(pe_chg)
+        ce_hist.append(ce_chg)
+
+    if len(pe_hist) == 10:
+        pe_avg = sum(pe_hist) / 10
+        ce_avg = sum(ce_hist) / 10
+    else:
+        pe_avg = None
+        ce_avg = None
+
+    data_buffer["range5_prev_pe_oi"] = pe_oi_r5
+    data_buffer["range5_prev_ce_oi"] = ce_oi_r5
+    data_buffer["range5_prev_pe_avg"] = pe_avg
+    data_buffer["range5_prev_ce_avg"] = ce_avg
+
+    return pe_avg or 0, ce_avg or 0, pe_ratio, ce_ratio
 
 
 def is_market_open():
@@ -162,6 +228,22 @@ def data_logger_loop(state):
             atm_pe_ltp = float(atm_row["pe_ltp"].iloc[0]) if not atm_row.empty else 0
             straddle = round(atm_ce_ltp + atm_pe_ltp, 2)
 
+            # Reset range=5 rolling history at the start of each new trading day
+            today_date = now_ist.date()
+            if data_buffer.get("range5_day") != today_date:
+                data_buffer["range5_day"] = today_date
+                data_buffer["range5_prev_pe_oi"] = 0
+                data_buffer["range5_prev_ce_oi"] = 0
+                data_buffer["range5_pe_chg_history"].clear()
+                data_buffer["range5_ce_chg_history"].clear()
+                data_buffer["range5_prev_pe_avg"] = None
+                data_buffer["range5_prev_ce_avg"] = None
+
+            # Range=5 (ATM ± 5 strikes) Avg(10m)/Ratio — persisted alongside this row
+            pe_oi_r5, ce_oi_r5 = _compute_range5_totals(chain_df, atm, strike_interval)
+            pe_avg_r5, ce_avg_r5, pe_ratio_r5, ce_ratio_r5 = _update_range5_avg_ratio(
+                data_buffer, pe_oi_r5, ce_oi_r5)
+
             # ── Build 1-min candle ───────────────────────
             current_minute = now_ist.minute
             if current_minute != last_candle_minute:
@@ -245,10 +327,16 @@ def data_logger_loop(state):
             data_buffer["data_source"] = getattr(md, '_data_source_log', 'UNKNOWN')
 
             # ── Save to database (with retry) ────────────
+            range5_avg_ratio = {
+                "pe_change_avg_10m": round(pe_avg_r5, 2),
+                "ce_change_avg_10m": round(ce_avg_r5, 2),
+                "pe_change_ratio": pe_ratio_r5,
+                "ce_change_ratio": ce_ratio_r5,
+            }
             if db_engine:
                 for attempt in range(3):
                     try:
-                        _save_to_db(db_engine, now_ist, snapshot, chain_df, underlying, future_ltp, pcr, pe_ce_diff, pe_ce_diff_change, straddle, atm, atm_ce_ltp, atm_pe_ltp, total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol)
+                        _save_to_db(db_engine, now_ist, snapshot, chain_df, underlying, future_ltp, pcr, pe_ce_diff, pe_ce_diff_change, straddle, atm, atm_ce_ltp, atm_pe_ltp, total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol, range5_avg_ratio)
                         break
                     except Exception as e:
                         if attempt < 2:
@@ -331,7 +419,7 @@ def _compute_signal(current_price, data_buffer, current_total_oi):
     return "N/A"
 
 
-def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp, pcr, pe_ce_diff, pe_ce_diff_change, straddle, atm, atm_ce_ltp, atm_pe_ltp, total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol):
+def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp, pcr, pe_ce_diff, pe_ce_diff_change, straddle, atm, atm_ce_ltp, atm_pe_ltp, total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol, range5_avg_ratio=None):
     """Synchronous DB write using psycopg2 (runs in background thread)."""
     import psycopg2
 
@@ -346,19 +434,23 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
         # Insert market snapshot
         futures_oi = snapshot.get("futures_oi", 0)
         pe_ce_diff_change_pct = snapshot.get("pe_ce_diff_change_pct", 0.0)
+        r5 = range5_avg_ratio or {}
         cur.execute("""
             INSERT INTO market_snapshots
             (timestamp, symbol, underlying_price, open, high, low, close, volume,
              total_ce_oi, total_pe_oi, total_ce_volume, total_pe_volume,
              pe_ce_oi_diff, pe_ce_oi_diff_change, pe_ce_oi_diff_change_pct, pcr,
-             future_ltp, future_oi_change, atm_strike, atm_ce_ltp, atm_pe_ltp, straddle_price, futures_oi)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             future_ltp, future_oi_change, atm_strike, atm_ce_ltp, atm_pe_ltp, straddle_price, futures_oi,
+             pe_change_avg_10m, ce_change_avg_10m, pe_change_ratio, ce_change_ratio)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             timestamp, "NIFTY", underlying, underlying, underlying, underlying, underlying,
             total_ce_vol + total_pe_vol,
             total_ce_oi, total_pe_oi, total_ce_vol, total_pe_vol,
             pe_ce_diff, pe_ce_diff_change, pe_ce_diff_change_pct, pcr,
-            future_ltp, 0, atm, atm_ce_ltp, atm_pe_ltp, straddle, futures_oi
+            future_ltp, 0, atm, atm_ce_ltp, atm_pe_ltp, straddle, futures_oi,
+            r5.get("pe_change_avg_10m", 0), r5.get("ce_change_avg_10m", 0),
+            r5.get("pe_change_ratio", 0), r5.get("ce_change_ratio", 0)
         ))
 
         # Insert per-strike snapshots
@@ -503,6 +595,23 @@ def init_database_sync():
         except Exception as e:
             conn.rollback()
             logger.debug("pe_ce_oi_diff_change_pct migration: %s", e)
+
+        # Migration: add change avg/ratio columns (values populated by
+        # scripts/backfill_avg_ratio_range5.py, not auto-backfilled here —
+        # the UI always recomputes these live per selected range, this
+        # column is only a persisted range=5 snapshot for external querying)
+        try:
+            cur4 = conn.cursor()
+            cur4.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS pe_change_avg_10m FLOAT DEFAULT 0;")
+            cur4.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS pe_change_ratio FLOAT DEFAULT 0;")
+            cur4.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS ce_change_avg_10m FLOAT DEFAULT 0;")
+            cur4.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS ce_change_ratio FLOAT DEFAULT 0;")
+            conn.commit()
+            cur4.close()
+            logger.info("[OK] change avg/ratio columns ready.")
+        except Exception as e:
+            conn.rollback()
+            logger.debug("change avg/ratio migration: %s", e)
 
         cur.close()
         conn.close()
