@@ -150,25 +150,25 @@ function buildTableHeader(){
     let h1='',h2='';
     h1+=`<th rowspan="2" class="col-time">Time ${_i('time')}</th>`;
     if(dm==='total'||dm==='all'){
-        h1+=`<th colspan="${dm==='all'?5:4}" class="col-group put-header">Put OI ${_i('put_oi')}</th>`;
-        h1+=`<th colspan="${dm==='all'?5:4}" class="col-group call-header">Call OI ${_i('call_oi')}</th>`;
+        h1+=`<th colspan="${dm==='all'?5:4}" class="col-group put-header col-divider">Put OI ${_i('put_oi')}</th>`;
+        h1+=`<th colspan="${dm==='all'?5:4}" class="col-group call-header col-divider">Call OI ${_i('call_oi')}</th>`;
     } else {
-        h1+=`<th colspan="4" class="col-group put-header">Put OI ${_i('put_oi')}</th>`;
-        h1+=`<th colspan="4" class="col-group call-header">Call OI ${_i('call_oi')}</th>`;
+        h1+=`<th colspan="4" class="col-group put-header col-divider">Put OI ${_i('put_oi')}</th>`;
+        h1+=`<th colspan="4" class="col-group call-header col-divider">Call OI ${_i('call_oi')}</th>`;
     }
-    h1+=`<th colspan="2" class="col-group diff-header">PE-CE OI ${_i('pe_ce_oi')}</th>`;
+    h1+=`<th colspan="4" class="col-group diff-header">PE-CE OI ${_i('pe_ce_oi')}</th>`;
     // Sub headers
     if(dm==='total'){
-        h2+=`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
-        h2+=`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
+        h2+=`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Std(10)</th><th class="sub col-divider">Z</th>`;
+        h2+=`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Std(10)</th><th class="sub col-divider">Z</th>`;
     } else if(dm==='change'){
-        h2+=`<th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
-        h2+=`<th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
+        h2+=`<th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Std(10)</th><th class="sub col-divider">Z</th>`;
+        h2+=`<th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Std(10)</th><th class="sub col-divider">Z</th>`;
     } else {
-        h2+=`<th class="sub">Total</th><th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
-        h2+=`<th class="sub">Total</th><th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Avg(10m)</th><th class="sub">Ratio</th>`;
+        h2+=`<th class="sub">Total</th><th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Std(10)</th><th class="sub col-divider">Z</th>`;
+        h2+=`<th class="sub">Total</th><th class="sub">Chg (Day)</th><th class="sub">Change</th><th class="sub">Std(10)</th><th class="sub col-divider">Z</th>`;
     }
-    h2+=`<th class="sub">Total</th><th class="sub">Change</th>`;
+    h2+=`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Net Z</th><th class="sub">Signal</th>`;
     thead.innerHTML=`<tr>${h1}</tr><tr>${h2}</tr>`;
 }
 
@@ -216,7 +216,7 @@ function renderOITable(data){
     if(rd&&data.range_display)rd.textContent=data.range_display;
     buildTableHeader();
     if(!data.rows||!data.rows.length){
-        document.getElementById('oi-table-body').innerHTML='<tr><td colspan="9" class="empty-msg">No data available</td></tr>';return;
+        document.getElementById('oi-table-body').innerHTML='<tr><td colspan="13" class="empty-msg">No data available</td></tr>';return;
     }
     const raw0=data.rows[0]._raw;
     if(raw0)document.getElementById('underlying-price').textContent=raw0.underlying?.toFixed(2)||'--';
@@ -228,54 +228,52 @@ function renderOITable(data){
         const raw=r._raw||{};
         const sig=r.signal||'N/A';const arrow=r.signal_arrow||'';
         const sigClass=sig==='LB'||sig==='SC'?'up':sig==='SB'||sig==='LU'?'down':'side';
-        let rowCls='';
 
-        // Ratio-based highlighting
-        // Only counts when the underlying avg was in L/Cr (>=1 lakh), not K — avoids noisy small-avg spikes
-        const peRatio=raw.pe_ratio_highlight_ok?Math.abs(raw.pe_change_ratio||0):0;
-        const ceRatio=raw.ce_ratio_highlight_ok?Math.abs(raw.ce_change_ratio||0):0;
-        const maxRatio=Math.max(peRatio,ceRatio);
-        if(maxRatio>=4){rowCls='row-highlight-orange';}
-        else if(maxRatio>=2){rowCls='row-highlight-yellow';}
+        // Highlight the row when the Z-score signal engine says BUY or SELL
+        const zSignal=raw.signal_z||'--';
+        let rowCls=(zSignal==='BUY'||zSignal==='SELL')?'row-highlight-yellow':'';
 
         let cols=`<td class="col-time">${r.time}</td>`;
         if(dm==='total'){
             cols+=`<td class="${vc(raw.total_pe_oi)}">${r.pe_oi_total}</td>`;
             cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
-            cols+=`<td class="val-neutral">${r.pe_change_avg||'--'}</td>`;
-            cols+=`<td class="${ratioClass(raw.pe_change_ratio,raw.pe_ratio_highlight_ok)}">${r.pe_change_ratio||'--'}</td>`;
+            cols+=`<td class="val-neutral">${r.pe_std10||'--'}</td>`;
+            cols+=`<td class="${zClass(raw.pe_z)} col-divider">${r.pe_z||'--'}</td>`;
             cols+=`<td class="${vc(raw.total_ce_oi)}">${r.ce_oi_total}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
-            cols+=`<td class="val-neutral">${r.ce_change_avg||'--'}</td>`;
-            cols+=`<td class="${ratioClass(raw.ce_change_ratio,raw.ce_ratio_highlight_ok)}">${r.ce_change_ratio||'--'}</td>`;
+            cols+=`<td class="val-neutral">${r.ce_std10||'--'}</td>`;
+            cols+=`<td class="${zClass(raw.ce_z)} col-divider">${r.ce_z||'--'}</td>`;
         } else if(dm==='change'){
             cols+=`<td class="${vc(raw.pe_oi_change_day)}">${r.pe_oi_change_day}</td>`;
             cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
-            cols+=`<td class="val-neutral">${r.pe_change_avg||'--'}</td>`;
-            cols+=`<td class="${ratioClass(raw.pe_change_ratio,raw.pe_ratio_highlight_ok)}">${r.pe_change_ratio||'--'}</td>`;
+            cols+=`<td class="val-neutral">${r.pe_std10||'--'}</td>`;
+            cols+=`<td class="${zClass(raw.pe_z)} col-divider">${r.pe_z||'--'}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
-            cols+=`<td class="val-neutral">${r.ce_change_avg||'--'}</td>`;
-            cols+=`<td class="${ratioClass(raw.ce_change_ratio,raw.ce_ratio_highlight_ok)}">${r.ce_change_ratio||'--'}</td>`;
+            cols+=`<td class="val-neutral">${r.ce_std10||'--'}</td>`;
+            cols+=`<td class="${zClass(raw.ce_z)} col-divider">${r.ce_z||'--'}</td>`;
         } else {
             cols+=`<td class="${vc(raw.total_pe_oi)}">${r.pe_oi_total}</td>`;
             cols+=`<td class="${vc(raw.pe_oi_change_day)}">${r.pe_oi_change_day}</td>`;
             cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
-            cols+=`<td class="val-neutral">${r.pe_change_avg||'--'}</td>`;
-            cols+=`<td class="${ratioClass(raw.pe_change_ratio,raw.pe_ratio_highlight_ok)}">${r.pe_change_ratio||'--'}</td>`;
+            cols+=`<td class="val-neutral">${r.pe_std10||'--'}</td>`;
+            cols+=`<td class="${zClass(raw.pe_z)} col-divider">${r.pe_z||'--'}</td>`;
             cols+=`<td class="${vc(raw.total_ce_oi)}">${r.ce_oi_total}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change_day)}">${r.ce_oi_change_day}</td>`;
             cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
-            cols+=`<td class="val-neutral">${r.ce_change_avg||'--'}</td>`;
-            cols+=`<td class="${ratioClass(raw.ce_change_ratio,raw.ce_ratio_highlight_ok)}">${r.ce_change_ratio||'--'}</td>`;
+            cols+=`<td class="val-neutral">${r.ce_std10||'--'}</td>`;
+            cols+=`<td class="${zClass(raw.ce_z)} col-divider">${r.ce_z||'--'}</td>`;
         }
         cols+=`<td class="${raw.pe_ce_diff>0?'pe-ce-pos':'pe-ce-neg'}">${r.pe_ce_total}</td>`;
         cols+=`<td class="${vc(raw.pe_ce_diff_change)}">${r.pe_ce_change}</td>`;
+        cols+=`<td class="${zClass(raw.net_z)}">${r.net_z||'--'}</td>`;
+        cols+=`<td class="${signalClass(zSignal)}">${zSignal}</td>`;
         return `<tr class="${rowCls}">${cols}</tr>`;
     }).join('');
 }
 function vc(v){return(!v||v===0)?'val-neutral':v>0?'val-pos':'val-neg';}
-function ratioClass(v,highlightOk){if(!highlightOk)return'val-neutral';const a=Math.abs(v||0);if(a>=4)return'val-neg';if(a>=2)return'val-pos';return'val-neutral';}
+function zClass(v){if(v===undefined||v===null||v==='--')return'val-neutral';const a=Math.abs(v);if(a>=3)return'val-neg';if(a>=2)return'val-pos';return'val-neutral';}
+function signalClass(sig){if(sig==='BUY')return'val-pos';if(sig==='SELL')return'val-neg';return'val-neutral';}
 
 /* ═══ SMART OI CHARTS ═══ */
 async function loadSmartOI(){

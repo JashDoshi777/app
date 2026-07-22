@@ -335,6 +335,9 @@ html, body {
 .diff-header { color: var(--purple) !important; }
 .future-header { color: var(--orange) !important; }
 
+/* Section divider between Put OI / Call OI / PE-CE OI groups */
+.col-divider { border-right: 1px solid rgba(255, 255, 255, 0.25) !important; }
+
 .oi-table td {
     padding: 7px 10px;
     text-align: center;
@@ -381,23 +384,14 @@ html, body {
     border-color: #42a5f5;
 }
 
-/* ═══ RATIO-BASED ROW HIGHLIGHTS ═══ */
-/* Ratio 2x–4x highlight (yellow) */
+/* ═══ Z-SCORE SIGNAL ROW HIGHLIGHT ═══ */
+/* Signal is BUY or SELL */
 .row-highlight-yellow {
     background: rgba(255, 238, 88, 0.18) !important;
     border-left: 3px solid #ffee58;
 }
 .row-highlight-yellow:hover {
     background: rgba(255, 238, 88, 0.28) !important;
-}
-
-/* Ratio ≥4x highlight (orange) */
-.row-highlight-orange {
-    background: rgba(255, 167, 38, 0.20) !important;
-    border-left: 3px solid #ffa726;
-}
-.row-highlight-orange:hover {
-    background: rgba(255, 167, 38, 0.30) !important;
 }
 
 /* ═══ PE-CE OI TOTAL COLUMN — StockMojo Style ═══ */

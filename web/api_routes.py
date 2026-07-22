@@ -68,6 +68,15 @@ def _fmt_lakh(n):
     return str(int(n))
 
 
+def _sample_stdev(values, mean):
+    """Sample standard deviation (denominator n-1), matching the verified Z-score formula."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return variance ** 0.5
+
+
 # ═══════════════════════════════════════════════════════════
 #  HELPER: Recompute OI totals from per-strike data + range
 # ═══════════════════════════════════════════════════════════
@@ -475,48 +484,58 @@ async def get_oi_table(
             },
         })
 
-    # STEP 4.5: Rolling 10-row average of Change, and ratio vs previous row's average.
+    # STEP 4.5: Z-score signal engine (Std(10)/Z/Net Z/Signal).
     # Row 0 (9:15) is always excluded — its Change is a placeholder 0, not real data.
-    # Rows 1-9 (9:16-9:24) stay blank — not enough rows for a full window yet.
-    # From row 10 (9:25) onward: Avg = trailing average of rows [_i-9 .. _i] (window excludes row 0).
-    # From row 11 (9:26) onward: Ratio = this row's own Change ÷ the Avg from the row before it.
-    _window = 10
-    _pe_avgs = {}  # row idx -> rolling avg (only for idx >= _window)
-    _ce_avgs = {}
-    for _i in range(_window, len(formatted)):
-        _pe_changes = [formatted[_j]["_raw"]["pe_oi_change"] for _j in range(_i - _window + 1, _i + 1)]
-        _ce_changes = [formatted[_j]["_raw"]["ce_oi_change"] for _j in range(_i - _window + 1, _i + 1)]
-        _pe_avgs[_i] = sum(_pe_changes) / _window
-        _ce_avgs[_i] = sum(_ce_changes) / _window
-
+    # For row t, Avg10/Std10 are computed from the 10 rows STRICTLY BEFORE t
+    # (rows [t-10, t-1]), never including row t itself and never touching row 0.
+    # First valid row is t=11 (9:26 if day starts 9:15) — window = rows 1-10.
+    _z_window = 10
     for _i, _f in enumerate(formatted):
-        if _i in _pe_avgs:
-            _f["pe_change_avg"] = _fmt_lakh(round(_pe_avgs[_i]))
-            _f["ce_change_avg"] = _fmt_lakh(round(_ce_avgs[_i]))
-            _f["_raw"]["pe_change_avg"] = round(_pe_avgs[_i], 2)
-            _f["_raw"]["ce_change_avg"] = round(_ce_avgs[_i], 2)
-        else:
-            _f["pe_change_avg"] = "--"
-            _f["ce_change_avg"] = "--"
-            _f["_raw"]["pe_change_avg"] = 0
-            _f["_raw"]["ce_change_avg"] = 0
+        _lo, _hi = _i - _z_window, _i - 1
+        if _lo >= 1:
+            _pe_hist = [formatted[_j]["_raw"]["pe_oi_change"] for _j in range(_lo, _hi + 1)]
+            _ce_hist = [formatted[_j]["_raw"]["ce_oi_change"] for _j in range(_lo, _hi + 1)]
+            _pe_avg = sum(_pe_hist) / _z_window
+            _ce_avg = sum(_ce_hist) / _z_window
+            _pe_std = _sample_stdev(_pe_hist, _pe_avg)
+            _ce_std = _sample_stdev(_ce_hist, _ce_avg)
+            _cur_pe = _f["_raw"]["pe_oi_change"]
+            _cur_ce = _f["_raw"]["ce_oi_change"]
+            _z_pe = (_cur_pe - _pe_avg) / _pe_std if _pe_std > 0 else 0.0
+            _z_ce = (_cur_ce - _ce_avg) / _ce_std if _ce_std > 0 else 0.0
+            _net_z = _z_pe - _z_ce
+            if _net_z < -3.0:
+                _signal_z = "BUY"
+            elif _net_z > 3.0:
+                _signal_z = "SELL"
+            else:
+                _signal_z = "WAIT"
 
-        _prev_i = _i - 1
-        if _prev_i in _pe_avgs:
-            _ppa, _pca = _pe_avgs[_prev_i], _ce_avgs[_prev_i]
-            _pr = round(_f["_raw"]["pe_oi_change"] / _ppa, 1) if abs(_ppa) > 100 else 0
-            _cr = round(_f["_raw"]["ce_oi_change"] / _pca, 1) if abs(_pca) > 100 else 0
+            _f["pe_std10"] = _fmt_lakh(round(_pe_std))
+            _f["ce_std10"] = _fmt_lakh(round(_ce_std))
+            _f["pe_z"] = f"{_z_pe:.2f}"
+            _f["ce_z"] = f"{_z_ce:.2f}"
+            _f["net_z"] = f"{_net_z:.2f}"
+            _f["signal_z"] = _signal_z
+            _f["_raw"]["pe_std10"] = round(_pe_std, 2)
+            _f["_raw"]["ce_std10"] = round(_ce_std, 2)
+            _f["_raw"]["pe_z"] = round(_z_pe, 4)
+            _f["_raw"]["ce_z"] = round(_z_ce, 4)
+            _f["_raw"]["net_z"] = round(_net_z, 4)
+            _f["_raw"]["signal_z"] = _signal_z
         else:
-            _ppa = _pca = 0
-            _pr = 0
-            _cr = 0
-        _f["pe_change_ratio"] = f"{_pr:.1f}X" if _pr != 0 else "--"
-        _f["ce_change_ratio"] = f"{_cr:.1f}X" if _cr != 0 else "--"
-        _f["_raw"]["pe_change_ratio"] = _pr
-        _f["_raw"]["ce_change_ratio"] = _cr
-        # Highlight eligibility: previous row's avg must be at least 1 lakh (L/Cr), not K — avoids noisy K-scale ratios
-        _f["_raw"]["pe_ratio_highlight_ok"] = abs(_ppa) >= 100000
-        _f["_raw"]["ce_ratio_highlight_ok"] = abs(_pca) >= 100000
+            _f["pe_std10"] = "--"
+            _f["ce_std10"] = "--"
+            _f["pe_z"] = "--"
+            _f["ce_z"] = "--"
+            _f["net_z"] = "--"
+            _f["signal_z"] = "--"
+            _f["_raw"]["pe_std10"] = 0
+            _f["_raw"]["ce_std10"] = 0
+            _f["_raw"]["pe_z"] = 0
+            _f["_raw"]["ce_z"] = 0
+            _f["_raw"]["net_z"] = 0
+            _f["_raw"]["signal_z"] = "--"
 
     # Reverse to newest-first for UI display
     formatted.reverse()
@@ -543,19 +562,20 @@ async def download_oi_csv(
     # Header
     writer.writerow([
         "Time",
-        "Put OI Total", "Put OI Chg(Day)", "Put OI Change", "Put Avg(10m)", "Put Ratio",
-        "Call OI Total", "Call OI Chg(Day)", "Call OI Change", "Call Avg(10m)", "Call Ratio",
-        "PE-CE OI", "PE-CE Change", "PCR",
+        "Put OI Total", "Put OI Chg(Day)", "Put OI Change", "Put Std(10)", "Put Z",
+        "Call OI Total", "Call OI Chg(Day)", "Call OI Change", "Call Std(10)", "Call Z",
+        "PE-CE OI", "PE-CE Change", "Net Z", "Signal", "PCR",
         "CE Volume", "PE Volume", "Total OI"
     ])
     for r in rows:
         writer.writerow([
             r.get("time", ""),
             r.get("pe_oi_total", ""), r.get("pe_oi_change_day", ""), r.get("pe_oi_change", ""),
-            r.get("pe_change_avg", "--"), r.get("pe_change_ratio", "--"),
+            r.get("pe_std10", "--"), r.get("pe_z", "--"),
             r.get("ce_oi_total", ""), r.get("ce_oi_change_day", ""), r.get("ce_oi_change", ""),
-            r.get("ce_change_avg", "--"), r.get("ce_change_ratio", "--"),
-            r.get("pe_ce_total", ""), r.get("pe_ce_change", ""), r.get("pcr", ""),
+            r.get("ce_std10", "--"), r.get("ce_z", "--"),
+            r.get("pe_ce_total", ""), r.get("pe_ce_change", ""), r.get("net_z", "--"), r.get("signal_z", "--"),
+            r.get("pcr", ""),
             r.get("ce_volume", ""), r.get("pe_volume", ""), r.get("total_oi", ""),
         ])
 
@@ -597,18 +617,19 @@ async def download_oi_md(
     if not rows:
         lines.append("_No data available for this selection._")
     else:
-        lines.append("| Time | Put OI Total | Put OI Chg(Day) | Put OI Change | Put Avg(10m) | Put Ratio | "
-                      "Call OI Total | Call OI Chg(Day) | Call OI Change | Call Avg(10m) | Call Ratio | "
-                      "PE-CE OI | PE-CE Change | PCR | CE Volume | PE Volume | Total OI |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        lines.append("| Time | Put OI Total | Put OI Chg(Day) | Put OI Change | Put Std(10) | Put Z | "
+                      "Call OI Total | Call OI Chg(Day) | Call OI Change | Call Std(10) | Call Z | "
+                      "PE-CE OI | PE-CE Change | Net Z | Signal | PCR | CE Volume | PE Volume | Total OI |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for r in rows:
             lines.append(
                 f"| {r.get('time', '')} "
                 f"| {r.get('pe_oi_total', '')} | {r.get('pe_oi_change_day', '')} | {r.get('pe_oi_change', '')} "
-                f"| {r.get('pe_change_avg', '--')} | {r.get('pe_change_ratio', '--')} "
+                f"| {r.get('pe_std10', '--')} | {r.get('pe_z', '--')} "
                 f"| {r.get('ce_oi_total', '')} | {r.get('ce_oi_change_day', '')} | {r.get('ce_oi_change', '')} "
-                f"| {r.get('ce_change_avg', '--')} | {r.get('ce_change_ratio', '--')} "
-                f"| {r.get('pe_ce_total', '')} | {r.get('pe_ce_change', '')} | {r.get('pcr', '')} "
+                f"| {r.get('ce_std10', '--')} | {r.get('ce_z', '--')} "
+                f"| {r.get('pe_ce_total', '')} | {r.get('pe_ce_change', '')} | {r.get('net_z', '--')} | {r.get('signal_z', '--')} "
+                f"| {r.get('pcr', '')} "
                 f"| {r.get('ce_volume', '')} | {r.get('pe_volume', '')} | {r.get('total_oi', '')} |"
             )
 
@@ -1387,45 +1408,56 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                 },
             })
 
-        # STEP 4: Rolling 10-row average of Change, and ratio vs previous row's average (same as live)
+        # STEP 4: Z-score signal engine (Std(10)/Z/Net Z/Signal) — same as live.
         # Row 0 is always excluded from windows — its Change is a placeholder 0, not real data.
-        _window = 10
-        _pe_avgs = {}
-        _ce_avgs = {}
-        for _i in range(_window, len(all_rows)):
-            _pe_changes = [all_rows[_j]["_raw"]["pe_oi_change"] for _j in range(_i - _window + 1, _i + 1)]
-            _ce_changes = [all_rows[_j]["_raw"]["ce_oi_change"] for _j in range(_i - _window + 1, _i + 1)]
-            _pe_avgs[_i] = sum(_pe_changes) / _window
-            _ce_avgs[_i] = sum(_ce_changes) / _window
-
+        # For row t, Avg10/Std10 come from rows [t-10, t-1] (strictly before t).
+        _z_window = 10
         for _i, _f in enumerate(all_rows):
-            if _i in _pe_avgs:
-                _f["pe_change_avg"] = _fmt_lakh(round(_pe_avgs[_i]))
-                _f["ce_change_avg"] = _fmt_lakh(round(_ce_avgs[_i]))
-                _f["_raw"]["pe_change_avg"] = round(_pe_avgs[_i], 2)
-                _f["_raw"]["ce_change_avg"] = round(_ce_avgs[_i], 2)
-            else:
-                _f["pe_change_avg"] = "--"
-                _f["ce_change_avg"] = "--"
-                _f["_raw"]["pe_change_avg"] = 0
-                _f["_raw"]["ce_change_avg"] = 0
+            _lo, _hi = _i - _z_window, _i - 1
+            if _lo >= 1:
+                _pe_hist = [all_rows[_j]["_raw"]["pe_oi_change"] for _j in range(_lo, _hi + 1)]
+                _ce_hist = [all_rows[_j]["_raw"]["ce_oi_change"] for _j in range(_lo, _hi + 1)]
+                _pe_avg = sum(_pe_hist) / _z_window
+                _ce_avg = sum(_ce_hist) / _z_window
+                _pe_std = _sample_stdev(_pe_hist, _pe_avg)
+                _ce_std = _sample_stdev(_ce_hist, _ce_avg)
+                _cur_pe = _f["_raw"]["pe_oi_change"]
+                _cur_ce = _f["_raw"]["ce_oi_change"]
+                _z_pe = (_cur_pe - _pe_avg) / _pe_std if _pe_std > 0 else 0.0
+                _z_ce = (_cur_ce - _ce_avg) / _ce_std if _ce_std > 0 else 0.0
+                _net_z = _z_pe - _z_ce
+                if _net_z < -3.0:
+                    _signal_z = "BUY"
+                elif _net_z > 3.0:
+                    _signal_z = "SELL"
+                else:
+                    _signal_z = "WAIT"
 
-            _prev_i = _i - 1
-            if _prev_i in _pe_avgs:
-                _ppa, _pca = _pe_avgs[_prev_i], _ce_avgs[_prev_i]
-                _pr = round(_f["_raw"]["pe_oi_change"] / _ppa, 1) if abs(_ppa) > 100 else 0
-                _cr = round(_f["_raw"]["ce_oi_change"] / _pca, 1) if abs(_pca) > 100 else 0
+                _f["pe_std10"] = _fmt_lakh(round(_pe_std))
+                _f["ce_std10"] = _fmt_lakh(round(_ce_std))
+                _f["pe_z"] = f"{_z_pe:.2f}"
+                _f["ce_z"] = f"{_z_ce:.2f}"
+                _f["net_z"] = f"{_net_z:.2f}"
+                _f["signal_z"] = _signal_z
+                _f["_raw"]["pe_std10"] = round(_pe_std, 2)
+                _f["_raw"]["ce_std10"] = round(_ce_std, 2)
+                _f["_raw"]["pe_z"] = round(_z_pe, 4)
+                _f["_raw"]["ce_z"] = round(_z_ce, 4)
+                _f["_raw"]["net_z"] = round(_net_z, 4)
+                _f["_raw"]["signal_z"] = _signal_z
             else:
-                _ppa = _pca = 0
-                _pr = 0
-                _cr = 0
-            _f["pe_change_ratio"] = f"{_pr:.1f}X" if _pr != 0 else "--"
-            _f["ce_change_ratio"] = f"{_cr:.1f}X" if _cr != 0 else "--"
-            _f["_raw"]["pe_change_ratio"] = _pr
-            _f["_raw"]["ce_change_ratio"] = _cr
-            # Highlight eligibility: previous row's avg must be at least 1 lakh (L/Cr), not K
-            _f["_raw"]["pe_ratio_highlight_ok"] = abs(_ppa) >= 100000
-            _f["_raw"]["ce_ratio_highlight_ok"] = abs(_pca) >= 100000
+                _f["pe_std10"] = "--"
+                _f["ce_std10"] = "--"
+                _f["pe_z"] = "--"
+                _f["ce_z"] = "--"
+                _f["net_z"] = "--"
+                _f["signal_z"] = "--"
+                _f["_raw"]["pe_std10"] = 0
+                _f["_raw"]["ce_std10"] = 0
+                _f["_raw"]["pe_z"] = 0
+                _f["_raw"]["ce_z"] = 0
+                _f["_raw"]["net_z"] = 0
+                _f["_raw"]["signal_z"] = "--"
 
         # Reverse to newest-first for display
         all_rows.reverse()

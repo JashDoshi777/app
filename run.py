@@ -64,6 +64,13 @@ data_buffer = {
     "range5_ce_chg_history": deque(maxlen=10),
     "range5_prev_pe_avg": None,
     "range5_prev_ce_avg": None,
+    # Z-score signal engine history (range=5) — separate rolling deque since
+    # Z's window is "10 rows strictly BEFORE this row" (current row excluded),
+    # unlike Avg(10m) which included the current row.
+    "z_prev_pe_oi": 0,
+    "z_prev_ce_oi": 0,
+    "z_pe_chg_history": deque(maxlen=10),
+    "z_ce_chg_history": deque(maxlen=10),
 }
 
 RANGE5_STRIKES = 5
@@ -123,6 +130,63 @@ def _update_range5_avg_ratio(data_buffer, pe_oi_r5, ce_oi_r5):
     data_buffer["range5_prev_ce_avg"] = ce_avg
 
     return pe_avg or 0, ce_avg or 0, pe_ratio, ce_ratio
+
+
+def _sample_stdev(values):
+    """Sample standard deviation (denominator n-1)."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return variance ** 0.5
+
+
+def _update_z_signal(data_buffer, pe_oi_r5, ce_oi_r5):
+    """
+    Z-score signal engine at range=5. For the current row's Change, compares
+    against the mean/stdev of the 10 REAL changes strictly before it (current
+    row's own change is never in its own window). First valid row is the one
+    completing 10 prior real changes (9:26 if day starts 9:15) — one row later
+    than Avg(10m), which included the current row in its own window.
+    Returns (pe_std, ce_std, z_pe, z_ce, net_z, signal) — signal is "--" until ready.
+    """
+    prev_pe_oi = data_buffer["z_prev_pe_oi"]
+    prev_ce_oi = data_buffer["z_prev_ce_oi"]
+    is_first_row_of_day = prev_pe_oi <= 0 and prev_ce_oi <= 0
+
+    pe_chg = pe_oi_r5 - prev_pe_oi if prev_pe_oi > 0 else 0
+    ce_chg = ce_oi_r5 - prev_ce_oi if prev_ce_oi > 0 else 0
+
+    pe_hist = data_buffer["z_pe_chg_history"]
+    ce_hist = data_buffer["z_ce_chg_history"]
+
+    if len(pe_hist) == 10:
+        pe_avg = sum(pe_hist) / 10
+        ce_avg = sum(ce_hist) / 10
+        pe_std = _sample_stdev(list(pe_hist))
+        ce_std = _sample_stdev(list(ce_hist))
+        z_pe = (pe_chg - pe_avg) / pe_std if pe_std > 0 else 0.0
+        z_ce = (ce_chg - ce_avg) / ce_std if ce_std > 0 else 0.0
+        net_z = z_pe - z_ce
+        if net_z < -3.0:
+            signal = "BUY"
+        elif net_z > 3.0:
+            signal = "SELL"
+        else:
+            signal = "WAIT"
+    else:
+        pe_std = ce_std = z_pe = z_ce = net_z = 0.0
+        signal = "--"
+
+    if not is_first_row_of_day:
+        pe_hist.append(pe_chg)
+        ce_hist.append(ce_chg)
+
+    data_buffer["z_prev_pe_oi"] = pe_oi_r5
+    data_buffer["z_prev_ce_oi"] = ce_oi_r5
+
+    return pe_std, ce_std, z_pe, z_ce, net_z, signal
 
 
 def is_market_open():
@@ -238,10 +302,16 @@ def data_logger_loop(state):
                 data_buffer["range5_ce_chg_history"].clear()
                 data_buffer["range5_prev_pe_avg"] = None
                 data_buffer["range5_prev_ce_avg"] = None
+                data_buffer["z_prev_pe_oi"] = 0
+                data_buffer["z_prev_ce_oi"] = 0
+                data_buffer["z_pe_chg_history"].clear()
+                data_buffer["z_ce_chg_history"].clear()
 
             # Range=5 (ATM ± 5 strikes) Avg(10m)/Ratio — persisted alongside this row
             pe_oi_r5, ce_oi_r5 = _compute_range5_totals(chain_df, atm, strike_interval)
             pe_avg_r5, ce_avg_r5, pe_ratio_r5, ce_ratio_r5 = _update_range5_avg_ratio(
+                data_buffer, pe_oi_r5, ce_oi_r5)
+            pe_std_r5, ce_std_r5, z_pe_r5, z_ce_r5, net_z_r5, signal_z_r5 = _update_z_signal(
                 data_buffer, pe_oi_r5, ce_oi_r5)
 
             # ── Build 1-min candle ───────────────────────
@@ -332,6 +402,12 @@ def data_logger_loop(state):
                 "ce_change_avg_10m": round(ce_avg_r5, 2),
                 "pe_change_ratio": pe_ratio_r5,
                 "ce_change_ratio": ce_ratio_r5,
+                "pe_std10": round(pe_std_r5, 2),
+                "ce_std10": round(ce_std_r5, 2),
+                "pe_z": round(z_pe_r5, 4),
+                "ce_z": round(z_ce_r5, 4),
+                "net_z": round(net_z_r5, 4),
+                "signal_z": signal_z_r5,
             }
             if db_engine:
                 for attempt in range(3):
@@ -441,8 +517,9 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
              total_ce_oi, total_pe_oi, total_ce_volume, total_pe_volume,
              pe_ce_oi_diff, pe_ce_oi_diff_change, pe_ce_oi_diff_change_pct, pcr,
              future_ltp, future_oi_change, atm_strike, atm_ce_ltp, atm_pe_ltp, straddle_price, futures_oi,
-             pe_change_avg_10m, ce_change_avg_10m, pe_change_ratio, ce_change_ratio)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             pe_change_avg_10m, ce_change_avg_10m, pe_change_ratio, ce_change_ratio,
+             pe_std10, ce_std10, pe_z, ce_z, net_z, signal_z)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             timestamp, "NIFTY", underlying, underlying, underlying, underlying, underlying,
             total_ce_vol + total_pe_vol,
@@ -450,7 +527,9 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
             pe_ce_diff, pe_ce_diff_change, pe_ce_diff_change_pct, pcr,
             future_ltp, 0, atm, atm_ce_ltp, atm_pe_ltp, straddle, futures_oi,
             r5.get("pe_change_avg_10m", 0), r5.get("ce_change_avg_10m", 0),
-            r5.get("pe_change_ratio", 0), r5.get("ce_change_ratio", 0)
+            r5.get("pe_change_ratio", 0), r5.get("ce_change_ratio", 0),
+            r5.get("pe_std10", 0), r5.get("ce_std10", 0),
+            r5.get("pe_z", 0), r5.get("ce_z", 0), r5.get("net_z", 0), r5.get("signal_z", "--")
         ))
 
         # Insert per-strike snapshots
@@ -612,6 +691,25 @@ def init_database_sync():
         except Exception as e:
             conn.rollback()
             logger.debug("change avg/ratio migration: %s", e)
+
+        # Migration: add Z-score signal engine columns (range=5), persisted
+        # live per-tick by run.py and backfilled for historical days via
+        # scripts/backfill_zscore_sql.py — the UI recomputes these live
+        # per selected range; these columns are for external querying/export.
+        try:
+            cur5 = conn.cursor()
+            cur5.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS pe_std10 FLOAT DEFAULT 0;")
+            cur5.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS ce_std10 FLOAT DEFAULT 0;")
+            cur5.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS pe_z FLOAT DEFAULT 0;")
+            cur5.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS ce_z FLOAT DEFAULT 0;")
+            cur5.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS net_z FLOAT DEFAULT 0;")
+            cur5.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS signal_z VARCHAR(10) DEFAULT '--';")
+            conn.commit()
+            cur5.close()
+            logger.info("[OK] Z-score signal columns ready.")
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Z-score signal migration: %s", e)
 
         cur.close()
         conn.close()

@@ -39,7 +39,7 @@
 
 ## 📊 The OI Data Table — Every Column Explained
 
-The main table has **11 columns** (in "Total OI" display mode) organized into groups. Here is every single one:
+The main table has **13 columns** (in "Total OI" display mode) organized into groups: Time, Put OI (Total/Change/Std(10)/Z), Call OI (Total/Change/Std(10)/Z), PE-CE OI (Total/Change/Net Z/Signal), plus PCR/Volume/Total OI. Here is every single one:
 
 ---
 
