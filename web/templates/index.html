@@ -6,7 +6,7 @@
     <title>NIFTY OI Tracker — Live</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css?v=16">
+    <link rel="stylesheet" href="/static/css/style.css?v=19">
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
         body{font-family:'Inter',sans-serif;background:#0c0e14;color:#e8eaed;min-height:100vh;font-size:13px}
@@ -47,7 +47,7 @@
         <div class="expiry-badge" id="expiry-badge">--</div>
     </div>
 
-    <div class="toolbar-center">
+    <div class="toolbar-center" id="toolbar-center">
         <div class="tf-group">
             <button class="tf-btn active" data-tf="1">1m</button>
             <button class="tf-btn" data-tf="3">3m</button>
@@ -77,7 +77,10 @@
     </div>
 </header>
 
-
+<nav class="tab-nav">
+    <button class="tab-btn active" data-tab="oi-table">OI Table</button>
+    <button class="tab-btn" data-tab="replay">Historical Data Testing</button>
+</nav>
 
 <!-- ═══ TAB 1: OI DATA TABLE ═══ -->
 <section class="tab-panel active" id="panel-oi-table">
@@ -122,20 +125,106 @@
                 <button class="download-btn" id="download-md-btn" title="Download Markdown">⬇ MD</button>
         </div>
     </div>
+
+    <!-- ═══ MULTI-TIMEFRAME CONFIRMATION STRIP ═══ -->
+    <div class="mtf-strip" id="mtf-strip">
+        <div class="mtf-left">
+            <span class="mtf-title">Multi-TF Confirmation <span class="col-info-icon" onclick="showColInfo('mtf_overview',event)">ⓘ</span></span>
+            <div class="mtf-tf-row" id="mtf-tf-row">
+                <!-- Per-timeframe badges rendered by JS -->
+            </div>
+        </div>
+        <div class="mtf-right">
+            <div class="mtf-metric" id="mtf-cascade">
+                <span class="mtf-metric-label">Cascade</span>
+                <span class="mtf-metric-value" id="mtf-cascade-value">--</span>
+            </div>
+            <div class="mtf-metric" id="mtf-expansion">
+                <span class="mtf-metric-label">Std Expansion</span>
+                <span class="mtf-metric-value" id="mtf-expansion-value">--</span>
+            </div>
+            <div class="mtf-metric" id="mtf-agreement">
+                <span class="mtf-metric-label">Agreement</span>
+                <span class="mtf-metric-value" id="mtf-agreement-value">--</span>
+            </div>
+            <div class="mtf-metric mtf-final-signal" id="mtf-final">
+                <span class="mtf-metric-label">Final Signal</span>
+                <span class="mtf-metric-value" id="mtf-final-value">--</span>
+            </div>
+        </div>
+    </div>
+
     <div class="table-container">
         <table class="oi-table" id="oi-data-table">
             <thead id="oi-table-head">
                 <!-- Table header is dynamically rendered by JS based on display mode -->
             </thead>
             <tbody id="oi-table-body">
-                <tr><td colspan="9" class="empty-msg">Waiting for market data...</td></tr>
+                <tr><td colspan="13" class="empty-msg">Waiting for market data...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<!-- ═══ TAB 2: HISTORICAL DATA TESTING (REPLAY) ═══ -->
+<section class="tab-panel" id="panel-replay">
+    <div class="table-header-bar">
+        <div class="table-filters">
+            <label class="filter-label">Date
+                <select id="replay-date">
+                    <option value="">Select Date</option>
+                </select>
+            </label>
+            <div class="tf-group" id="replay-tf-group">
+                <button class="tf-btn active" data-replay-tf="1">1m</button>
+                <button class="tf-btn" data-replay-tf="3">3m</button>
+                <button class="tf-btn" data-replay-tf="5">5m</button>
+                <button class="tf-btn" data-replay-tf="10">10m</button>
+                <button class="tf-btn" data-replay-tf="15">15m</button>
+                <button class="tf-btn" data-replay-tf="30">30m</button>
+            </div>
+            <button class="download-btn" id="replay-prev-btn" disabled>← Prev</button>
+            <button class="download-btn" id="replay-next-btn" disabled>Next →</button>
+            <span class="range-display" id="replay-cursor-display">--</span>
+        </div>
+    </div>
+
+    <div class="mtf-strip" id="replay-mtf-strip">
+        <div class="mtf-left">
+            <span class="mtf-title">Multi-TF Confirmation <span class="col-info-icon" onclick="showColInfo('mtf_overview',event)">ⓘ</span></span>
+            <div class="mtf-tf-row" id="replay-mtf-tf-row"></div>
+        </div>
+        <div class="mtf-right">
+            <div class="mtf-metric">
+                <span class="mtf-metric-label">Cascade</span>
+                <span class="mtf-metric-value" id="replay-mtf-cascade-value">--</span>
+            </div>
+            <div class="mtf-metric">
+                <span class="mtf-metric-label">Std Expansion</span>
+                <span class="mtf-metric-value" id="replay-mtf-expansion-value">--</span>
+            </div>
+            <div class="mtf-metric">
+                <span class="mtf-metric-label">Agreement</span>
+                <span class="mtf-metric-value" id="replay-mtf-agreement-value">--</span>
+            </div>
+            <div class="mtf-metric mtf-final-signal">
+                <span class="mtf-metric-label">Final Signal</span>
+                <span class="mtf-metric-value" id="replay-mtf-final-value">--</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="table-container">
+        <table class="oi-table" id="replay-data-table">
+            <thead id="replay-table-head"></thead>
+            <tbody id="replay-table-body">
+                <tr><td colspan="13" class="empty-msg">Select a date to begin replay.</td></tr>
             </tbody>
         </table>
     </div>
 </section>
 
 
-
-<script src="/static/js/app.js?v=22"></script>
+<script src="/static/js/app.js?v=25"></script>
 </body>
 </html>

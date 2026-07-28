@@ -4,6 +4,7 @@ Fetches live option chain every minute, logs to NeonDB, serves dashboard.
 Includes: auto-reconnect, DB retry, health checks.
 """
 
+import asyncio
 import logging
 import os
 import sys
@@ -18,7 +19,7 @@ import config
 from core.market_data import MarketDataService
 from core.option_chain import OptionChainAnalyzer
 from web.app import app
-from web.api_routes import router as api_router, inject_engines
+from web.api_routes import router as api_router, inject_engines, get_multi_tf_signal
 
 # IST timezone
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -396,6 +397,16 @@ def data_logger_loop(state):
             data_buffer["total_logs"] += 1
             data_buffer["data_source"] = getattr(md, '_data_source_log', 'UNKNOWN')
 
+            # ── Multi-timeframe confirmation (range=5) ───
+            # Reuses the same live in-memory buffer this tick just updated —
+            # no DB round-trip, so this stays fast during market hours.
+            # Only the FINAL composite is persisted (see migration comment).
+            mtf_result = None
+            try:
+                mtf_result = asyncio.run(get_multi_tf_signal(range_strikes=RANGE5_STRIKES, auto_atm=True, mode="live", date=""))
+            except Exception as e:
+                logger.debug("Multi-TF snapshot failed: %s", e)
+
             # ── Save to database (with retry) ────────────
             range5_avg_ratio = {
                 "pe_change_avg_10m": round(pe_avg_r5, 2),
@@ -409,6 +420,15 @@ def data_logger_loop(state):
                 "net_z": round(net_z_r5, 4),
                 "signal_z": signal_z_r5,
             }
+            if mtf_result:
+                range5_avg_ratio.update({
+                    "mtf_agreement_score": mtf_result.get("agreement_score", 0),
+                    "mtf_conviction": mtf_result.get("conviction", "--"),
+                    "mtf_cascade_direction": (mtf_result.get("cascade") or {}).get("direction") or "--",
+                    "mtf_cascade_depth": (mtf_result.get("cascade") or {}).get("depth", 0),
+                    "mtf_compression_expansion": (mtf_result.get("std_expansion") or {}).get("compression_expansion_setup", False),
+                    "mtf_final_signal": mtf_result.get("final_signal", "--"),
+                })
             if db_engine:
                 for attempt in range(3):
                     try:
@@ -518,8 +538,10 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
              pe_ce_oi_diff, pe_ce_oi_diff_change, pe_ce_oi_diff_change_pct, pcr,
              future_ltp, future_oi_change, atm_strike, atm_ce_ltp, atm_pe_ltp, straddle_price, futures_oi,
              pe_change_avg_10m, ce_change_avg_10m, pe_change_ratio, ce_change_ratio,
-             pe_std10, ce_std10, pe_z, ce_z, net_z, signal_z)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             pe_std10, ce_std10, pe_z, ce_z, net_z, signal_z,
+             mtf_agreement_score, mtf_conviction, mtf_cascade_direction, mtf_cascade_depth,
+             mtf_compression_expansion, mtf_final_signal)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             timestamp, "NIFTY", underlying, underlying, underlying, underlying, underlying,
             total_ce_vol + total_pe_vol,
@@ -529,7 +551,10 @@ def _save_to_db(db_engine, timestamp, snapshot, chain_df, underlying, future_ltp
             r5.get("pe_change_avg_10m", 0), r5.get("ce_change_avg_10m", 0),
             r5.get("pe_change_ratio", 0), r5.get("ce_change_ratio", 0),
             r5.get("pe_std10", 0), r5.get("ce_std10", 0),
-            r5.get("pe_z", 0), r5.get("ce_z", 0), r5.get("net_z", 0), r5.get("signal_z", "--")
+            r5.get("pe_z", 0), r5.get("ce_z", 0), r5.get("net_z", 0), r5.get("signal_z", "--"),
+            r5.get("mtf_agreement_score", 0), r5.get("mtf_conviction", "--"),
+            r5.get("mtf_cascade_direction", "--"), r5.get("mtf_cascade_depth", 0),
+            r5.get("mtf_compression_expansion", False), r5.get("mtf_final_signal", "--")
         ))
 
         # Insert per-strike snapshots
@@ -710,6 +735,29 @@ def init_database_sync():
         except Exception as e:
             conn.rollback()
             logger.debug("Z-score signal migration: %s", e)
+
+        # Migration: add multi-timeframe confirmation columns (range=5).
+        # Stores only the FINAL composite outputs (not all 6 raw per-TF
+        # Z-scores — that's cheap to recompute live and not worth 30+ extra
+        # columns): agreement score, conviction bucket, cascade depth/
+        # direction, compression->expansion flag, and the persistence-
+        # filtered final signal (which may downgrade a raw 1m BUY/SELL to
+        # WAIT if 3m/5m don't confirm). See web/api_routes.py's multi-TF
+        # engine and claude.md for the full formulas.
+        try:
+            cur6 = conn.cursor()
+            cur6.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS mtf_agreement_score INT DEFAULT 0;")
+            cur6.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS mtf_conviction VARCHAR(20) DEFAULT '--';")
+            cur6.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS mtf_cascade_direction VARCHAR(10) DEFAULT '--';")
+            cur6.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS mtf_cascade_depth INT DEFAULT 0;")
+            cur6.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS mtf_compression_expansion BOOLEAN DEFAULT FALSE;")
+            cur6.execute("ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS mtf_final_signal VARCHAR(10) DEFAULT '--';")
+            conn.commit()
+            cur6.close()
+            logger.info("[OK] Multi-timeframe confirmation columns ready.")
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Multi-timeframe confirmation migration: %s", e)
 
         cur.close()
         conn.close()

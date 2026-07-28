@@ -25,14 +25,17 @@ function initTabs(){
             document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
             document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
             btn.classList.add('active');currentTab=btn.dataset.tab;
-            document.getElementById(`panel-${currentTab}`).classList.add('active');loadAllData();
+            document.getElementById(`panel-${currentTab}`).classList.add('active');
+            const tc=document.getElementById('toolbar-center');
+            if(tc)tc.style.display=currentTab==='replay'?'none':'flex';
+            loadAllData();
         });
     });
 }
 function initTimeframeButtons(){
-    document.querySelectorAll('.tf-btn').forEach(btn=>{
+    document.querySelectorAll('header .tf-btn').forEach(btn=>{
         btn.addEventListener('click',()=>{
-            document.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('active'));
+            document.querySelectorAll('header .tf-btn').forEach(b=>b.classList.remove('active'));
             btn.classList.add('active');currentTf=parseInt(btn.dataset.tf)||1;
             destroyTVChart();loadAllData();
         });
@@ -102,14 +105,86 @@ async function checkMarketStatus(){
 
 async function loadAllData(){
     try{
-        if(currentTab==='oi-table')await loadOITable();
+        if(currentTab==='oi-table'){await loadOITable();loadMultiTF();}
         if(currentTab==='smart-oi')await loadSmartOI();
         if(currentTab==='price-oi')await loadPriceVsOI();
+        if(currentTab==='replay')initReplayTab();
     }catch(e){console.error('loadAllData:',e);}
+}
+
+/* ═══ MULTI-TIMEFRAME CONFIRMATION ═══ */
+const MTF_LABELS={1:'1m',3:'3m',5:'5m',10:'10m',15:'15m',30:'30m'};
+const _mtfCache={};
+const MTF_CACHE_TTL_LIVE=20000;
+const MTF_CACHE_TTL_HIST=300000;
+
+async function loadMultiTF(){
+    try{
+        const rng=document.getElementById('strike-range');const range=rng?rng.value:5;
+        const key=`${currentMode}_${range}_${autoATM}_${historicalDate}`;
+        const ttl=currentMode==='live'?MTF_CACHE_TTL_LIVE:MTF_CACHE_TTL_HIST;
+        const cached=_mtfCache[key];
+        if(cached&&(Date.now()-cached.ts)<ttl){renderMultiTF(cached.data);return;}
+        if(cached)renderMultiTF(cached.data);
+
+        let url=`/api/multi-tf-signal?range_strikes=${range}&auto_atm=${autoATM}`;
+        if(currentMode==='historical'&&historicalDate)url+=`&mode=historical&date=${historicalDate}`;
+        const res=await fetch(url);const data=await res.json();
+        _mtfCache[key]={data,ts:Date.now()};
+        renderMultiTF(data);
+    }catch(e){console.error('MultiTF:',e);}
+}
+
+function renderMultiTF(data){
+    const tfRow=document.getElementById('mtf-tf-row');
+    if(!tfRow||!data||!data.timeframes)return;
+
+    tfRow.innerHTML=Object.keys(MTF_LABELS).map(tf=>{
+        const d=data.timeframes[tf]||{};
+        if(!d.ready){
+            return `<div class="mtf-tf-badge mtf-not-ready"><span class="mtf-tf-label">${MTF_LABELS[tf]}</span><span class="mtf-tf-net-z">--</span></div>`;
+        }
+        const score=d.trend_score||0;
+        const dirCls=score>0?'mtf-bullish':score<0?'mtf-bearish':'mtf-neutral';
+        const agreeCls=d.agrees_with_trigger?'mtf-agrees':'';
+        const nz=d.net_z!==null&&d.net_z!==undefined?d.net_z.toFixed(2):'--';
+        const stdTrend=d.std_trend||'--';
+        const stdArrow=stdTrend==='rising'?'<span class="mtf-std-arrow mtf-std-rising">↑</span>'
+            :stdTrend==='falling'?'<span class="mtf-std-arrow mtf-std-falling">↓</span>'
+            :stdTrend==='flat'?'<span class="mtf-std-arrow mtf-std-flat">→</span>':'';
+        return `<div class="mtf-tf-badge ${dirCls} ${agreeCls}" title="Std(10) trend: ${stdTrend}">`
+            +`<span class="mtf-tf-label">${MTF_LABELS[tf]}</span>`
+            +`<span class="mtf-tf-net-z">${nz}${stdArrow}</span></div>`;
+    }).join('');
+
+    const cascade=data.cascade||{};
+    const cascadeEl=document.getElementById('mtf-cascade-value');
+    if(cascade.direction){
+        cascadeEl.textContent=`${cascade.direction==='bullish'?'▲':'▼'} depth ${cascade.depth}`;
+        cascadeEl.style.color=cascade.direction==='bullish'?'var(--green-bright)':'var(--red-bright)';
+    }else{
+        cascadeEl.textContent='--';cascadeEl.style.color='';
+    }
+
+    const expEl=document.getElementById('mtf-expansion-value');
+    const compExp=data.std_expansion&&data.std_expansion.compression_expansion_setup;
+    expEl.textContent=compExp?'Compression→Expansion':'--';
+    expEl.className='mtf-metric-value'+(compExp?' mtf-expansion-flag':'');
+
+    const agreeEl=document.getElementById('mtf-agreement-value');
+    agreeEl.textContent=`${data.agreement_score||0}/100`;
+    agreeEl.className='mtf-metric-value mtf-conviction-'+(data.conviction||'no_edge');
+
+    const finalEl=document.getElementById('mtf-final-value');
+    const finalSig=data.final_signal||'--';
+    finalEl.textContent=finalSig;
+    finalEl.className='mtf-metric-value mtf-signal-'+finalSig;
+    finalEl.title=data.final_signal_reason?`Reason: ${data.final_signal_reason} (raw 1m signal: ${data.raw_1m_signal})`:'';
 }
 
 /* ═══ COLUMN INFO SYSTEM ═══ */
 const COL_INFO = {
+    mtf_overview: {t:'Multi-Timeframe Confirmation', d:'Checks whether 1m/3m/5m/10m/15m/30m Z-scores agree on direction before trusting a signal — a lone 1-minute Z spike is noise-prone, so nearby timeframes must confirm it.\n\n• Badges: each TF\'s Net Z, colored by direction (green=bullish, red=bearish), outlined if it agrees with the 1m trigger\n• Cascade: does Net Z point the same way across 1m→3m→5m→10m in order? Depth = how many keep agreeing\n• Std Expansion: "Compression→Expansion" flags when short TFs (1m/3m) show rising volatility while longer TFs (10m/15m) are still flat — often precedes a directional move\n• Agreement: weighted 0-100 score (1m=25, 3m=20, 5m=20, 10m=15, 15m=10, 30m=10) — 90+ very strong, 70-89 strong, 50-69 watch, <50 no edge\n• Final Signal: the 1-minute Signal, DOWNGRADED to WAIT unless 3m confirms the same direction and 5m doesn\'t contradict (persistence filter)\n\nWeights and thresholds are a first-pass default, not yet backtested against this dashboard\'s historical signal distribution.'},
     time: {t:'Time', d:'IST timestamp of when this data snapshot was captured.\n\nData is refreshed every 60 seconds during market hours (9:15 AM – 3:30 PM IST).'},
     put_oi: {t:'Put OI', d:'Total Put (PE) Open Interest summed across all strikes in the selected ATM ± Range.\n\nHigher Put OI generally indicates bearish hedging or bullish support (writers expect price to stay above).'},
     put_total: {t:'Put OI → Total', d:'Current total Put OI across all strikes in the ATM ± Range filter.\n\nThis value is re-aggregated from per-strike data every refresh.'},
@@ -274,6 +349,207 @@ function renderOITable(data){
 function vc(v){return(!v||v===0)?'val-neutral':v>0?'val-pos':'val-neg';}
 function zClass(v){if(v===undefined||v===null||v==='--')return'val-neutral';const a=Math.abs(v);if(a>=3)return'val-neg';if(a>=2)return'val-pos';return'val-neutral';}
 function signalClass(sig){if(sig==='BUY')return'val-pos';if(sig==='SELL')return'val-neg';return'val-neutral';}
+
+/* ═══ HISTORICAL DATA TESTING (REPLAY) ═══ */
+let replayInitDone=false;
+let replayDate='',replayTf=1,replayTimestamps=[],replayIndex=-1;
+
+function initReplayTab(){
+    if(!replayInitDone){
+        replayInitDone=true;
+        initReplayControls();
+        loadReplayDates();
+    }
+}
+
+function initReplayControls(){
+    const dateSel=document.getElementById('replay-date');
+    if(dateSel)dateSel.addEventListener('change',async()=>{
+        replayDate=dateSel.value;
+        await onReplayDateChange();
+    });
+
+    document.querySelectorAll('#replay-tf-group .tf-btn').forEach(btn=>{
+        btn.addEventListener('click',()=>{
+            document.querySelectorAll('#replay-tf-group .tf-btn').forEach(b=>b.classList.remove('active'));
+            btn.classList.add('active');
+            replayTf=parseInt(btn.dataset.replayTf)||1;
+        });
+    });
+
+    const prevBtn=document.getElementById('replay-prev-btn');
+    const nextBtn=document.getElementById('replay-next-btn');
+    if(prevBtn)prevBtn.addEventListener('click',()=>replayStep(-1));
+    if(nextBtn)nextBtn.addEventListener('click',()=>replayStep(1));
+}
+
+async function loadReplayDates(){
+    try{
+        const res=await fetch('/api/historical-dates');const data=await res.json();
+        const sel=document.getElementById('replay-date');
+        if(sel&&data.dates)sel.innerHTML='<option value="">Select Date</option>'+data.dates.map(d=>`<option value="${d}">${d}</option>`).join('');
+    }catch(e){console.error('Replay dates:',e);}
+}
+
+async function onReplayDateChange(){
+    if(!replayDate){
+        replayTimestamps=[];replayIndex=-1;
+        document.getElementById('replay-prev-btn').disabled=true;
+        document.getElementById('replay-next-btn').disabled=true;
+        return;
+    }
+    try{
+        const res=await fetch(`/api/replay-timestamps?date=${replayDate}`);
+        const data=await res.json();
+        replayTimestamps=data.timestamps||[];
+        replayIndex=replayTimestamps.length?0:-1; // start of day: 9:15
+        updateReplayButtons();
+        if(replayIndex>=0)await loadReplaySnapshot();
+    }catch(e){console.error('Replay date change:',e);}
+}
+
+function updateReplayButtons(){
+    const prevBtn=document.getElementById('replay-prev-btn');
+    const nextBtn=document.getElementById('replay-next-btn');
+    if(!prevBtn||!nextBtn)return;
+    prevBtn.disabled=replayIndex<=0;
+    nextBtn.disabled=replayIndex<0||replayIndex>=replayTimestamps.length-1;
+}
+
+async function replayStep(direction){
+    if(replayLoading||replayIndex<0||!replayTimestamps.length)return;
+    const next=replayIndex+direction*replayTf;
+    replayIndex=Math.max(0,Math.min(replayTimestamps.length-1,next));
+    updateReplayButtons();
+    await loadReplaySnapshot();
+}
+
+let replayLoading=false;
+async function loadReplaySnapshot(){
+    if(replayIndex<0||!replayTimestamps.length)return;
+    const asOfTime=replayTimestamps[replayIndex];
+    const cursorEl=document.getElementById('replay-cursor-display');
+    if(cursorEl)cursorEl.textContent=`Cursor: ${asOfTime} (${replayIndex+1}/${replayTimestamps.length}) — loading...`;
+    replayLoading=true;
+    setReplayControlsEnabled(false);
+    try{
+        const rng=document.getElementById('strike-range');const range=rng?rng.value:5;
+        const res=await fetch(`/api/replay-snapshot?date=${replayDate}&as_of_time=${asOfTime}&range_strikes=${range}`);
+        const data=await res.json();
+        renderReplayTable(data.rows||[]);
+        renderReplayMultiTF(data.multi_tf||{});
+        if(cursorEl)cursorEl.textContent=`Cursor: ${asOfTime} (${replayIndex+1}/${replayTimestamps.length})`;
+    }catch(e){
+        console.error('Replay snapshot:',e);
+        if(cursorEl)cursorEl.textContent=`Cursor: ${asOfTime} (${replayIndex+1}/${replayTimestamps.length}) — failed to load`;
+    }finally{
+        replayLoading=false;
+        setReplayControlsEnabled(true);
+        updateReplayButtons();
+    }
+}
+
+function setReplayControlsEnabled(enabled){
+    const prevBtn=document.getElementById('replay-prev-btn');
+    const nextBtn=document.getElementById('replay-next-btn');
+    if(!enabled){
+        if(prevBtn)prevBtn.disabled=true;
+        if(nextBtn)nextBtn.disabled=true;
+    }
+    // when re-enabling, updateReplayButtons() (called by the caller) sets the correct bounds
+}
+
+function buildReplayTableHeader(){
+    const thead=document.getElementById('replay-table-head');if(!thead)return;
+    const h1=`<th rowspan="2" class="col-time">Time</th>`
+        +`<th colspan="4" class="col-group put-header col-divider">Put OI</th>`
+        +`<th colspan="4" class="col-group call-header col-divider">Call OI</th>`
+        +`<th colspan="4" class="col-group diff-header">PE-CE OI</th>`;
+    const h2=`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Std(10)</th><th class="sub col-divider">Z</th>`
+        +`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Std(10)</th><th class="sub col-divider">Z</th>`
+        +`<th class="sub">Total</th><th class="sub">Change</th><th class="sub">Net Z</th><th class="sub">Signal</th>`;
+    thead.innerHTML=`<tr>${h1}</tr><tr>${h2}</tr>`;
+}
+
+function renderReplayTable(rows){
+    buildReplayTableHeader();
+    const tbody=document.getElementById('replay-table-body');
+    if(!tbody)return;
+    if(!rows.length){tbody.innerHTML='<tr><td colspan="13" class="empty-msg">No data available</td></tr>';return;}
+
+    // Rows arrive newest-first (same convention as the live table) — replay
+    // wants the accumulating table to read chronologically top-to-bottom.
+    const chrono=[...rows].reverse();
+    tbody.innerHTML=chrono.map(r=>{
+        const raw=r._raw||{};
+        const zSignal=raw.signal_z||'--';
+        const rowCls=(zSignal==='BUY'||zSignal==='SELL')?'row-highlight-yellow':'';
+        let cols=`<td class="col-time">${r.time}</td>`;
+        cols+=`<td class="${vc(raw.total_pe_oi)}">${r.pe_oi_total}</td>`;
+        cols+=`<td class="${vc(raw.pe_oi_change)}">${r.pe_oi_change}</td>`;
+        cols+=`<td class="val-neutral">${r.pe_std10||'--'}</td>`;
+        cols+=`<td class="${zClass(raw.pe_z)} col-divider">${r.pe_z||'--'}</td>`;
+        cols+=`<td class="${vc(raw.total_ce_oi)}">${r.ce_oi_total}</td>`;
+        cols+=`<td class="${vc(raw.ce_oi_change)}">${r.ce_oi_change}</td>`;
+        cols+=`<td class="val-neutral">${r.ce_std10||'--'}</td>`;
+        cols+=`<td class="${zClass(raw.ce_z)} col-divider">${r.ce_z||'--'}</td>`;
+        cols+=`<td class="${raw.pe_ce_diff>0?'pe-ce-pos':'pe-ce-neg'}">${r.pe_ce_total}</td>`;
+        cols+=`<td class="${vc(raw.pe_ce_diff_change)}">${r.pe_ce_change}</td>`;
+        cols+=`<td class="${zClass(raw.net_z)}">${r.net_z||'--'}</td>`;
+        cols+=`<td class="${signalClass(zSignal)}">${zSignal}</td>`;
+        return `<tr class="${rowCls}">${cols}</tr>`;
+    }).join('');
+
+    // Keep the latest (most recently revealed) row in view
+    tbody.parentElement.parentElement.scrollTop=tbody.parentElement.parentElement.scrollHeight;
+}
+
+function renderReplayMultiTF(data){
+    const tfRow=document.getElementById('replay-mtf-tf-row');
+    if(!tfRow||!data||!data.timeframes)return;
+
+    tfRow.innerHTML=Object.keys(MTF_LABELS).map(tf=>{
+        const d=data.timeframes[tf]||{};
+        if(!d.ready){
+            return `<div class="mtf-tf-badge mtf-not-ready"><span class="mtf-tf-label">${MTF_LABELS[tf]}</span><span class="mtf-tf-net-z">--</span></div>`;
+        }
+        const score=d.trend_score||0;
+        const dirCls=score>0?'mtf-bullish':score<0?'mtf-bearish':'mtf-neutral';
+        const agreeCls=d.agrees_with_trigger?'mtf-agrees':'';
+        const nz=d.net_z!==null&&d.net_z!==undefined?d.net_z.toFixed(2):'--';
+        const stdTrend=d.std_trend||'--';
+        const stdArrow=stdTrend==='rising'?'<span class="mtf-std-arrow mtf-std-rising">↑</span>'
+            :stdTrend==='falling'?'<span class="mtf-std-arrow mtf-std-falling">↓</span>'
+            :stdTrend==='flat'?'<span class="mtf-std-arrow mtf-std-flat">→</span>':'';
+        return `<div class="mtf-tf-badge ${dirCls} ${agreeCls}" title="Std(10) trend: ${stdTrend}">`
+            +`<span class="mtf-tf-label">${MTF_LABELS[tf]}</span>`
+            +`<span class="mtf-tf-net-z">${nz}${stdArrow}</span></div>`;
+    }).join('');
+
+    const cascade=data.cascade||{};
+    const cascadeEl=document.getElementById('replay-mtf-cascade-value');
+    if(cascade.direction){
+        cascadeEl.textContent=`${cascade.direction==='bullish'?'▲':'▼'} depth ${cascade.depth}`;
+        cascadeEl.style.color=cascade.direction==='bullish'?'var(--green-bright)':'var(--red-bright)';
+    }else{
+        cascadeEl.textContent='--';cascadeEl.style.color='';
+    }
+
+    const expEl=document.getElementById('replay-mtf-expansion-value');
+    const compExp=data.std_expansion&&data.std_expansion.compression_expansion_setup;
+    expEl.textContent=compExp?'Compression→Expansion':'--';
+    expEl.className='mtf-metric-value'+(compExp?' mtf-expansion-flag':'');
+
+    const agreeEl=document.getElementById('replay-mtf-agreement-value');
+    agreeEl.textContent=`${data.agreement_score||0}/100`;
+    agreeEl.className='mtf-metric-value mtf-conviction-'+(data.conviction||'no_edge');
+
+    const finalEl=document.getElementById('replay-mtf-final-value');
+    const finalSig=data.final_signal||'--';
+    finalEl.textContent=finalSig;
+    finalEl.className='mtf-metric-value mtf-signal-'+finalSig;
+    finalEl.title=data.final_signal_reason?`Reason: ${data.final_signal_reason} (raw 1m signal: ${data.raw_1m_signal})`:'';
+}
 
 /* ═══ SMART OI CHARTS ═══ */
 async function loadSmartOI(){

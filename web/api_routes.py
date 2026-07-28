@@ -49,6 +49,53 @@ def inject_engines(state: dict):
     _engine_state.update(state)
 
 
+# ═══════════════════════════════════════════════════════════
+#  HISTORICAL DB CONNECTION POOL
+#
+#  Opening a fresh psycopg2 connection to Neon (serverless Postgres) costs
+#  ~1.7s regardless of query size — verified via direct timing. The
+#  multi-timeframe replay engine calls _get_historical_oi_table 6 times
+#  (once per timeframe) per Next/Prev press, each historically opening its
+#  own connection(s), which was the dominant cost of replay mode (~15-20s
+#  per step). A pool keeps a handful of connections alive and hands one to
+#  each caller — safe for concurrent use from multiple threads because each
+#  thread gets its OWN connection out of the pool (never a connection
+#  shared/reused concurrently across threads, which is what caused a real
+#  correctness bug in an earlier attempt at this — see git history).
+#  Created lazily on first use, not at import time, since DATABASE_URL may
+#  not be configured in every context that imports this module.
+# ═══════════════════════════════════════════════════════════
+
+_hist_db_pool = None
+
+
+def _get_hist_db_pool():
+    """Lazily create (once) and return the shared historical-DB connection pool, or None if unavailable."""
+    global _hist_db_pool
+    if _hist_db_pool is not None:
+        return _hist_db_pool
+    db_url = os.environ.get("DATABASE_URL", config.DATABASE_URL)
+    if not db_url:
+        return None
+    try:
+        import psycopg2.pool
+        # IMPORTANT: psycopg2's pool only KEEPS a returned connection idle in
+        # the pool while len(pool) < minconn — anything returned beyond that
+        # is closed immediately, not retained (verified by reading
+        # AbstractConnectionPool._putconn's source). With minconn=2 but 6
+        # concurrent connections needed per replay call (one per timeframe),
+        # 4 of the 6 were being closed and reopened on every single call,
+        # which is why an earlier version of this pool barely sped anything
+        # up. minconn=8 keeps all 6 (plus headroom) genuinely warm between
+        # requests; maxconn=16 allows temporary bursts (e.g. two replay
+        # requests overlapping) without failing outright.
+        _hist_db_pool = psycopg2.pool.ThreadedConnectionPool(8, 16, db_url)
+        return _hist_db_pool
+    except Exception as e:
+        logger.warning("Historical DB pool init failed, falling back to direct connections: %s", e)
+        return None
+
+
 def _is_market_open() -> bool:
     now = datetime.now(IST)
     if now.weekday() >= 5:
@@ -541,6 +588,391 @@ async def get_oi_table(
     formatted.reverse()
 
     return _sanitize({"rows": formatted, "range_display": latest_range_display})
+
+
+# ═══════════════════════════════════════════════════════════
+#  MULTI-TIMEFRAME CONFIRMATION ENGINE
+#
+#  Builds on the single-timeframe Z-score engine above by checking whether
+#  1m/3m/5m/10m/15m/30m agree on direction before trusting a signal. A lone
+#  1-minute Z spike is noise-prone (see "Known Limitations" in claude.md);
+#  requiring nearby timeframes to agree is standard multi-timeframe
+#  confluence and directly targets that weakness.
+# ═══════════════════════════════════════════════════════════
+
+MTF_TIMEFRAMES = [1, 3, 5, 10, 15, 30]
+
+# Weight per timeframe for the Agreement Score (0-100), higher for faster/
+# nearer timeframes since they react first — NOT empirically tuned against
+# this dashboard's historical signal distribution, same caveat as the ±3.0
+# Z threshold. Treat as a first-pass default, revisit once there's enough
+# historical signal data to backtest against.
+MTF_WEIGHTS = {1: 25, 3: 20, 5: 20, 10: 15, 15: 10, 30: 10}
+
+# Net Z deadzone for trend scoring (bullish/bearish/neutral) — deliberately
+# looser than the ±3.0 BUY/SELL signal threshold, since requiring every
+# timeframe to independently cross ±3.0 before "agreeing" would almost
+# never happen (longer timeframes are naturally less spiky). This threshold
+# asks only "which way is this timeframe leaning", not "is it a full signal".
+MTF_TREND_THRESHOLD = 1.0
+
+
+def _mtf_trend_score(net_z):
+    """Bullish=+1 (Net Z very negative = puts panicking = bullish squeeze), Bearish=-1, Neutral=0."""
+    if net_z is None:
+        return 0
+    if net_z <= -MTF_TREND_THRESHOLD:
+        return 1
+    if net_z >= MTF_TREND_THRESHOLD:
+        return -1
+    return 0
+
+
+async def _compute_multi_tf_snapshot(range_strikes, auto_atm, mode, date, as_of_time="", use_threads=True):
+    """
+    Runs the existing single-timeframe Z-score pipeline once per timeframe
+    (1/3/5/10/15/30m) and extracts each one's LATEST row's Z-engine output.
+    Reuses get_oi_table/_get_historical_oi_table as-is — no duplicated
+    aggregation logic, so this always matches whatever the single-TF table
+    shows for that timeframe.
+
+    as_of_time (optional, "HH:MM", historical mode only): truncates the
+    day to rows <= as_of_time before computing anything, with ATM derived
+    from that truncated set — true point-in-time replay/backtesting
+    (see _get_historical_oi_table). Ignored in live mode, where "now" is
+    always the latest live row anyway.
+
+    use_threads (default True): dispatch the 6 calls to worker threads via
+    asyncio.to_thread for genuine concurrency — worth it when each call is
+    a slow, uncached DB round-trip (the current per-click replay design, or
+    live mode). use_threads=False exists for a since-reverted "precompute
+    the whole day upfront" design (see _compute_multi_tf_result's
+    docstring) — once _fetch_historical_raw has cached a date, each call
+    becomes a ~0.02-0.05s in-process cache hit, and spawning 6 OS threads
+    per cursor across ~376 cursors cost far more than the work itself
+    (verified via timing: threaded took several minutes total; direct,
+    no-thread calls took seconds). Not currently exercised by any live code
+    path, kept as a tested option if a precompute approach is revisited.
+    """
+    import asyncio
+
+    def _run_sync(tf):
+        if mode == "historical" and date:
+            coro = _get_historical_oi_table(date, tf, range_strikes, as_of_time)
+        else:
+            coro = get_oi_table(tf=tf, range_strikes=range_strikes, auto_atm=auto_atm, mode=mode, date=date)
+        return tf, asyncio.run(coro)
+
+    if use_threads:
+        results = await asyncio.gather(*[asyncio.to_thread(_run_sync, tf) for tf in MTF_TIMEFRAMES])
+    else:
+        results = []
+        for tf in MTF_TIMEFRAMES:
+            if mode == "historical" and date:
+                data = await _get_historical_oi_table(date, tf, range_strikes, as_of_time)
+            else:
+                data = await get_oi_table(tf=tf, range_strikes=range_strikes, auto_atm=auto_atm, mode=mode, date=date)
+            results.append((tf, data))
+
+    # How many rows back (at each timeframe) to look for the Std10 "then"
+    # comparison point in _mtf_std_expansion — e.g. for tf=1 this is 5
+    # minutes ago; for tf=15 it's 5 windows (75 minutes) ago. Kept as row
+    # count (not wall-clock) to match every other rolling window in this
+    # engine, so a data gap just uses whatever row is 5 back rather than
+    # erroring.
+    STD_LOOKBACK_ROWS = 5
+
+    per_tf = {}
+    for tf, data in results:
+        rows = data.get("rows", []) if isinstance(data, dict) else []
+        if not rows:
+            per_tf[tf] = None
+            continue
+        latest = rows[0]
+        raw = latest.get("_raw", {})
+        net_z = raw.get("net_z")
+        signal = raw.get("signal_z", "--")
+        # net_z is 0 both for "not enough history yet" and a genuine flat 0.0 —
+        # disambiguate using signal_z, which is explicitly "--" only when unready.
+        ready = signal != "--"
+
+        # Std10 from STD_LOOKBACK_ROWS rows ago (rows[] is newest-first), for
+        # the "is THIS timeframe's own volatility rising over time" check.
+        prev_std = None
+        if len(rows) > STD_LOOKBACK_ROWS:
+            prev_raw = rows[STD_LOOKBACK_ROWS].get("_raw", {})
+            if prev_raw.get("signal_z", "--") != "--":
+                prev_std = (prev_raw.get("pe_std10", 0.0) + prev_raw.get("ce_std10", 0.0)) / 2
+
+        per_tf[tf] = {
+            "time": latest.get("time"),
+            "pe_z": raw.get("pe_z", 0.0) if ready else None,
+            "ce_z": raw.get("ce_z", 0.0) if ready else None,
+            "net_z": net_z if ready else None,
+            "pe_std10": raw.get("pe_std10", 0.0) if ready else None,
+            "ce_std10": raw.get("ce_std10", 0.0) if ready else None,
+            "std10_prev": prev_std,
+            "signal": signal,
+            "ready": ready,
+        }
+    return per_tf
+
+
+def _mtf_std_expansion(per_tf):
+    """
+    Std Expansion Chain: compares each timeframe's CURRENT Std10 against ITS
+    OWN Std10 from a few rows ago (same timeframe, not cross-timeframe —
+    Std10 naturally grows with timeframe size since longer windows
+    accumulate bigger OI swings, so comparing 1m's Std10 to 3m's Std10
+    directly would almost never show "expansion" no matter what's actually
+    happening). "Rising" = this timeframe's own volatility is increasing
+    over its own recent history.
+    """
+    labels = {}
+    for tf in MTF_TIMEFRAMES:
+        d = per_tf.get(tf)
+        if not d or not d["ready"] or d["std10_prev"] is None:
+            labels[tf] = "--"
+            continue
+        cur = (d["pe_std10"] + d["ce_std10"]) / 2
+        prev = d["std10_prev"]
+        if prev <= 0:
+            labels[tf] = "--"
+        elif cur > prev * 1.15:
+            labels[tf] = "rising"
+        elif cur < prev * 0.85:
+            labels[tf] = "falling"
+        else:
+            labels[tf] = "flat"
+
+    # Compression -> Expansion pattern: short TFs (1m, 3m) OWN volatility
+    # rising while long TFs (10m, 15m) OWN volatility is still flat/unclear —
+    # the setup called out as "one of the best" in the multi-timeframe
+    # proposal (short-horizon vol picking up before longer horizons show it).
+    compression_expansion = (
+        labels.get(1) == "rising" and labels.get(3) in ("rising", "flat")
+        and labels.get(10) in ("flat", "--") and labels.get(15) in ("flat", "--")
+    )
+
+    return {"labels": labels, "compression_expansion": compression_expansion}
+
+
+def _mtf_cascade(per_tf):
+    """
+    Z Cascade: does Net Z point the same direction across 1m -> 3m -> 5m -> 10m,
+    in increasing order of timeframe? Indicates sustained institutional
+    positioning rather than a one-off blip. Returns direction ("bullish"/
+    "bearish"/None) and how many consecutive timeframes (starting from 1m)
+    keep agreeing before the chain breaks.
+    """
+    chain_tfs = [1, 3, 5, 10]
+    scores = [_mtf_trend_score(per_tf[tf]["net_z"]) if per_tf.get(tf) and per_tf[tf]["ready"] else 0 for tf in chain_tfs]
+    if scores[0] == 0:
+        return {"direction": None, "depth": 0}
+    direction = scores[0]
+    depth = 0
+    for s in scores:
+        if s == direction:
+            depth += 1
+        else:
+            break
+    return {
+        "direction": "bullish" if direction == 1 else "bearish",
+        "depth": depth,
+    }
+
+
+def _mtf_agreement_score(per_tf, trigger_direction):
+    """
+    Multi-Timeframe Agreement Score (0-100): awards each timeframe's weight
+    if its trend score matches the 1-minute trigger's direction. If the
+    trigger itself is neutral, the score is 0 (nothing to confirm).
+    """
+    if trigger_direction == 0:
+        return 0
+    total = 0
+    breakdown = {}
+    for tf in MTF_TIMEFRAMES:
+        d = per_tf.get(tf)
+        score = _mtf_trend_score(d["net_z"]) if d and d["ready"] else 0
+        agrees = score == trigger_direction
+        breakdown[tf] = agrees
+        if agrees:
+            total += MTF_WEIGHTS[tf]
+    return total, breakdown
+
+
+def _mtf_persistence_filter(per_tf):
+    """
+    Persistence Filter: don't trust the raw 1-minute Signal until 3m confirms
+    the same direction and 5m doesn't outright contradict it. This is the
+    single highest-value change from the multi-timeframe proposal — it
+    directly suppresses the false-positive failure mode of a lone noisy
+    1-minute Z spike (see Known Limitations in claude.md).
+    Returns the FILTERED signal (may downgrade BUY/SELL to WAIT) plus why.
+    """
+    tf1 = per_tf.get(1)
+    if not tf1 or not tf1["ready"] or tf1["signal"] not in ("BUY", "SELL"):
+        return {"signal": tf1["signal"] if tf1 else "--", "reason": "no_1m_signal"}
+
+    trigger_dir = 1 if tf1["signal"] == "BUY" else -1
+
+    tf3 = per_tf.get(3)
+    tf5 = per_tf.get(5)
+    tf3_score = _mtf_trend_score(tf3["net_z"]) if tf3 and tf3["ready"] else 0
+    tf5_score = _mtf_trend_score(tf5["net_z"]) if tf5 and tf5["ready"] else 0
+
+    if tf3_score != trigger_dir:
+        return {"signal": "WAIT", "reason": "3m_not_confirmed"}
+    if tf5_score == -trigger_dir:
+        return {"signal": "WAIT", "reason": "5m_contradicts"}
+
+    return {"signal": tf1["signal"], "reason": "confirmed"}
+
+
+async def _compute_multi_tf_result(range_strikes, auto_atm, mode, date, as_of_time="", use_threads=True):
+    """
+    Shared implementation behind /api/multi-tf-signal — extracted so other
+    internal callers (e.g. /api/replay-snapshot) can call it directly
+    instead of going through the route function + its Query(...) parameter
+    defaults, which only make sense for an actual HTTP request. The
+    use_threads flag exists for a precompute-the-whole-day path that was
+    tried and reverted (took ~105s total even without thread overhead —
+    see git history) in favor of the current fast per-click design, backed
+    by _fetch_historical_raw's per-date cache; kept here since it's a real,
+    tested option if a future precompute approach is revisited.
+    """
+    per_tf = await _compute_multi_tf_snapshot(range_strikes, auto_atm, mode, date, as_of_time, use_threads=use_threads)
+
+    tf1 = per_tf.get(1)
+    trigger_dir = _mtf_trend_score(tf1["net_z"]) if tf1 and tf1["ready"] else 0
+
+    cascade = _mtf_cascade(per_tf)
+    expansion = _mtf_std_expansion(per_tf)
+    agreement_score, agreement_breakdown = _mtf_agreement_score(per_tf, trigger_dir) if trigger_dir != 0 else (0, {})
+    persistence = _mtf_persistence_filter(per_tf)
+
+    if agreement_score >= 90:
+        conviction = "very_strong"
+    elif agreement_score >= 70:
+        conviction = "strong"
+    elif agreement_score >= 50:
+        conviction = "watch"
+    else:
+        conviction = "no_edge"
+
+    timeframes_out = {}
+    for tf in MTF_TIMEFRAMES:
+        d = per_tf.get(tf)
+        if not d:
+            timeframes_out[str(tf)] = {"ready": False}
+            continue
+        timeframes_out[str(tf)] = {
+            "ready": d["ready"],
+            "time": d["time"],
+            "pe_z": round(d["pe_z"], 2) if d["pe_z"] is not None else None,
+            "ce_z": round(d["ce_z"], 2) if d["ce_z"] is not None else None,
+            "net_z": round(d["net_z"], 2) if d["net_z"] is not None else None,
+            "trend_score": _mtf_trend_score(d["net_z"]) if d["ready"] else 0,
+            "signal": d["signal"],
+            "std_trend": expansion["labels"].get(tf, "--"),
+            "agrees_with_trigger": agreement_breakdown.get(tf, False),
+        }
+
+    return _sanitize({
+        "timeframes": timeframes_out,
+        "trigger_direction": trigger_dir,
+        "cascade": cascade,
+        "std_expansion": {
+            "compression_expansion_setup": expansion["compression_expansion"],
+        },
+        "agreement_score": agreement_score,
+        "conviction": conviction,
+        "final_signal": persistence["signal"],
+        "final_signal_reason": persistence["reason"],
+        "raw_1m_signal": tf1["signal"] if tf1 else "--",
+    })
+
+
+@router.get("/multi-tf-signal")
+async def get_multi_tf_signal(
+    range_strikes: int = Query(5, description="Number of strikes from ATM each side"),
+    auto_atm: bool = Query(True),
+    mode: str = Query("live", description="live or historical"),
+    date: str = Query("", description="Date for historical mode (YYYY-MM-DD)"),
+    as_of_time: str = Query("", description="Replay mode only: 'HH:MM' cursor — truncates the day to this point for true point-in-time simulation"),
+):
+    """
+    Multi-timeframe confirmation snapshot: per-TF Z/Std/Signal, trend score,
+    Z cascade depth, Std expansion chain, agreement score, and the
+    persistence-filtered final signal. Works identically for live and
+    historical mode — same per-timeframe pipeline either way.
+    """
+    return await _compute_multi_tf_result(range_strikes, auto_atm, mode, date, as_of_time, use_threads=True)
+
+
+# ═══════════════════════════════════════════════════════════
+#  HISTORICAL DATA TESTING (REPLAY MODE)
+#
+#  Lets you step minute-by-minute (or in N-minute jumps) through a
+#  historical day as if it were arriving live, watching the multi-TF
+#  metrics update exactly as they would have in real time. Everything here
+#  reuses the already-verified single-TF and multi-TF engines with
+#  as_of_time truncation — no separate computation path to keep in sync.
+# ═══════════════════════════════════════════════════════════
+
+@router.get("/replay-timestamps")
+async def get_replay_timestamps(date: str = Query(..., description="Date (YYYY-MM-DD)")):
+    """
+    Ordered list of every raw 1-minute timestamp available for a historical
+    day, so the frontend can compute step positions (e.g. 'Next at 3m' =
+    jump 3 entries forward in this list) without re-implementing any
+    windowing logic client-side.
+
+    Reuses _fetch_historical_raw's per-date cache instead of running its
+    own separate query — this is the FIRST call the frontend makes on
+    every date-select (before any /api/replay-snapshot call), so it used
+    to pay its own ~1.7s+ cold connection on top of the raw-data fetch
+    that was about to happen anyway moments later. Now it either primes
+    the cache (first call for a date) or reads straight from it (already
+    warm), so there's only ever ONE cold DB round-trip per date-select,
+    not two.
+    """
+    raw = _fetch_historical_raw(date)
+    if raw is None or raw.get("error"):
+        return {"timestamps": [], "error": raw.get("error") if raw else "No database"}
+
+    def _hhmm(ts):
+        if hasattr(ts, 'astimezone'):
+            return ts.astimezone(IST).strftime("%H:%M")
+        if hasattr(ts, 'strftime'):
+            return (ts + timedelta(hours=5, minutes=30)).strftime("%H:%M")
+        return ""
+
+    timestamps = [_hhmm(r["timestamp"]) for r in raw.get("ms_rows", [])]
+    return _sanitize({"timestamps": timestamps})
+
+
+@router.get("/replay-snapshot")
+async def get_replay_snapshot(
+    date: str = Query(..., description="Date (YYYY-MM-DD)"),
+    as_of_time: str = Query(..., description="Cursor position, 'HH:MM' — truncates the day to this point"),
+    range_strikes: int = Query(5, description="Number of strikes from ATM each side"),
+):
+    """
+    Point-in-time replay snapshot: every 1-minute row from market open up
+    through as_of_time (full live-mode columns, accumulating as the cursor
+    advances), plus the multi-TF confirmation metrics computed AS OF that
+    exact cursor — true simulation of what a live trader would have seen
+    at that moment, not "the whole day's final view truncated for display."
+    """
+    table_data = await _get_historical_oi_table(date, tf=1, range_strikes=range_strikes, as_of_time=as_of_time)
+    mtf_data = await _compute_multi_tf_result(range_strikes, True, "historical", date, as_of_time, use_threads=True)
+    return _sanitize({
+        "rows": table_data.get("rows", []),
+        "range_display": table_data.get("range_display", ""),
+        "multi_tf": mtf_data,
+    })
 
 
 @router.get("/download-oi")
@@ -1139,19 +1571,40 @@ def _build_candles(price_data, tf):
     return candles
 
 
-async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
-    """Fetch historical OI table from database with range filtering."""
+# In-memory cache of raw (unfiltered, whole-day) historical data per date.
+# _get_historical_oi_table is called many times for the same date (once per
+# timeframe x once per replay cursor position), and the raw DB fetch is
+# identical every time — only the in-Python as_of_time truncation and
+# per-range aggregation differ per call. Caching this here means a whole
+# day's replay (376 cursor positions x 6 timeframes) does the real DB I/O
+# ONCE, not 2000+ times. Keyed by date only (not range/tf/as_of_time) since
+# this is the UNFILTERED raw data every call further narrows down itself.
+_hist_raw_cache = {}
+_HIST_RAW_CACHE_MAX_DATES = 8  # small LRU-ish cap so this can't grow unbounded across many dates in one server run
+
+
+def _fetch_historical_raw(date: str):
+    """
+    Fetch and cache the raw (whole-day, unfiltered) historical data needed
+    by _get_historical_oi_table: market_snapshots rows, futures_oi map,
+    per-strike oi_snapshots grouped by timestamp, and previous trading
+    day's closing OI. Returns None if no DATABASE_URL configured, or a dict
+    with an "error" key on query failure — otherwise the raw data dict.
+    """
+    if date in _hist_raw_cache:
+        return _hist_raw_cache[date]
+
     import config
     db_url = os.environ.get("DATABASE_URL", config.DATABASE_URL)
     if not db_url:
-        return {"rows": [], "error": "No database"}
+        return None
 
+    import psycopg2
+    pool = _get_hist_db_pool()
+    conn = pool.getconn() if pool else psycopg2.connect(db_url)
     try:
-        import psycopg2
-        conn = psycopg2.connect(db_url)
         cur = conn.cursor()
 
-        # Always need market_snapshots for ATM, straddle, future, delta change data
         cur.execute("""
             SELECT timestamp, underlying_price, total_ce_oi, total_pe_oi,
                    pe_ce_oi_diff, pe_ce_oi_diff_change, pcr, future_ltp,
@@ -1167,10 +1620,10 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
 
         if not ms_rows:
             cur.close()
-            conn.close()
-            return {"rows": [], "date": date}
+            result = {"ms_rows": [], "foi_map": {}, "ts_strike_groups": {}, "prev_day_ce_oi": 0, "prev_day_pe_oi": 0}
+            _hist_raw_cache[date] = result
+            return result
 
-        # Try to read futures_oi if column exists
         try:
             cur.execute("""
                 SELECT timestamp, futures_oi FROM market_snapshots
@@ -1183,14 +1636,6 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
             conn.rollback()
             foi_map = {}
 
-        si = config.INDICES.get("NIFTY", {}).get("strike_interval", 50)
-
-        # Auto ATM: compute from LATEST row's futures LTP (same as live mode)
-        latest = ms_rows[-1]
-        latest_fut = float(latest.get("future_ltp", 0) or 0) or float(latest.get("underlying_price", 0) or 0)
-        computed_atm = round(latest_fut / si) * si if latest_fut > 0 else float(latest.get("atm_strike", 0) or 0)
-
-        # Check if per-strike data is available for range filtering
         cur.execute("""
             SELECT COUNT(*) FROM oi_snapshots
             WHERE symbol = 'NIFTY'
@@ -1199,7 +1644,6 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
         """, (date,))
         has_strikes = cur.fetchone()[0] > 0
 
-        # Build per-strike data lookup
         ts_strike_groups = {}
         if has_strikes:
             cur.execute("""
@@ -1224,14 +1668,11 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                 })
 
         cur.close()
-        conn.close()
 
-        # Query PREVIOUS day's closing OI for accurate "Chg Day" (matches StockMojo)
         prev_day_ce_oi = 0
         prev_day_pe_oi = 0
         try:
-            conn2 = psycopg2.connect(db_url)
-            cur2 = conn2.cursor()
+            cur2 = conn.cursor()
             cur2.execute("""
                 SELECT DISTINCT DATE(timestamp AT TIME ZONE 'Asia/Kolkata') as dt
                 FROM market_snapshots
@@ -1255,9 +1696,99 @@ async def _get_historical_oi_table(date: str, tf: int, range_strikes: int):
                     prev_day_ce_oi = int(close_row[0] or 0)
                     prev_day_pe_oi = int(close_row[1] or 0)
             cur2.close()
-            conn2.close()
         except Exception as e:
+            conn.rollback()
             logger.debug("Failed to load prev day baseline for historical: %s", e)
+
+        if prev_day_ce_oi == 0 and prev_day_pe_oi == 0:
+            prev_day_ce_oi = int(ms_rows[0].get("total_ce_oi", 0) or 0)
+            prev_day_pe_oi = int(ms_rows[0].get("total_pe_oi", 0) or 0)
+
+        result = {
+            "ms_rows": ms_rows,
+            "foi_map": foi_map,
+            "ts_strike_groups": ts_strike_groups,
+            "prev_day_ce_oi": prev_day_ce_oi,
+            "prev_day_pe_oi": prev_day_pe_oi,
+        }
+        if len(_hist_raw_cache) >= _HIST_RAW_CACHE_MAX_DATES:
+            # Evict the oldest-inserted entry (dicts preserve insertion order in Python 3.7+)
+            _hist_raw_cache.pop(next(iter(_hist_raw_cache)))
+        _hist_raw_cache[date] = result
+        return result
+    except Exception as e:
+        logger.error("Historical raw fetch failed for %s: %s", date, e)
+        return {"error": str(e)}
+    finally:
+        if pool:
+            pool.putconn(conn)
+        else:
+            conn.close()
+
+
+async def _get_historical_oi_table(date: str, tf: int, range_strikes: int, as_of_time: str = ""):
+    """
+    Fetch historical OI table from database with range filtering.
+
+    as_of_time (optional, "HH:MM"): when given, truncates the day's rows to
+    timestamp <= as_of_time BEFORE computing anything, and Auto ATM is
+    derived from THAT truncated set's last row instead of the whole day's
+    last row. This is what makes replay/backtesting mode a true point-in-
+    time simulation — a live trader at 9:16 can't know the day's closing
+    futures price, so ATM (and everything downstream: ranged OI, Z-scores)
+    must only ever see data up to the cursor. Default "" preserves the
+    normal historical-table behavior (whole-day final ATM, all rows).
+
+    Uses the shared _hist_db_pool (see _get_hist_db_pool) when available —
+    the multi-TF replay pipeline calls this function 6 times (once per
+    timeframe) per Next/Prev press, and opening a fresh connection each
+    time was the dominant cost (~1.7s/connect to Neon, serverless, verified
+    via direct timing — far more than any query or data-volume cost). Each
+    call borrows its OWN connection from the pool (never shares one
+    concurrently across threads/calls — an earlier attempt at sharing a
+    single connection across sequential calls caused wrong query results
+    and was reverted). Falls back to a direct connect-then-close if the
+    pool isn't available for any reason.
+    """
+    raw = _fetch_historical_raw(date)
+    if raw is None:
+        return {"rows": [], "error": "No database"}
+    if raw.get("error"):
+        return {"rows": [], "error": raw["error"]}
+
+    try:
+        import config
+        ms_rows_all = raw["ms_rows"]
+        foi_map = raw["foi_map"]
+        ts_strike_groups = raw["ts_strike_groups"]
+        prev_day_ce_oi = raw["prev_day_ce_oi"]
+        prev_day_pe_oi = raw["prev_day_pe_oi"]
+
+        ms_rows = ms_rows_all
+        if as_of_time:
+            def _hhmm(ts):
+                if hasattr(ts, 'astimezone'):
+                    return ts.astimezone(IST).strftime("%H:%M")
+                if hasattr(ts, 'strftime'):
+                    return (ts + timedelta(hours=5, minutes=30)).strftime("%H:%M")
+                return ""
+            ms_rows = [r for r in ms_rows_all if _hhmm(r["timestamp"]) <= as_of_time]
+
+        if not ms_rows:
+            return {"rows": [], "date": date}
+
+        si = config.INDICES.get("NIFTY", {}).get("strike_interval", 50)
+
+        # Auto ATM: compute from LATEST row's futures LTP (same as live mode).
+        # When as_of_time truncated ms_rows above, "latest" is genuinely the
+        # latest row up to that cursor — true point-in-time ATM.
+        latest = ms_rows[-1]
+        latest_fut = float(latest.get("future_ltp", 0) or 0) or float(latest.get("underlying_price", 0) or 0)
+        computed_atm = round(latest_fut / si) * si if latest_fut > 0 else float(latest.get("atm_strike", 0) or 0)
+
+        # prev_day_ce_oi / prev_day_pe_oi already fetched once in
+        # _fetch_historical_raw (previous-day close doesn't depend on the
+        # current cursor/as_of_time at all, so no need to refetch per-call).
 
         # Fallback: if no previous day data, use first row of current day
         if prev_day_ce_oi == 0 and prev_day_pe_oi == 0:
